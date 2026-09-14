@@ -48,8 +48,7 @@
     "url": "https://github.com/MunhozThiago/opencode-agent-factory-plugin"
   },
   "publishConfig": {
-    "access": "public",
-    "provenance": true
+    "access": "public"
   },
   "opencode": {
     "name": "Agent Factory",
