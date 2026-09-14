@@ -1,1 +1,202 @@
 # opencode-agent-factory-plugin
+
+Dynamic multi-agent orchestration for [OpenCode](https://opencode.ai). Analyzes prompts, generates specialized agents at runtime, executes them in parallel with dependency resolution, and synthesizes results using consensus protocols.
+
+Inspired by [SpawnVerse](https://github.com/sajosam/spawnverse) (runtime agent generation), [oh-my-openagent](https://github.com/code-yeongyu/oh-my-openagent) (parallel team mode), and [SIM-ONE](https://github.com/dansasser/SIM-ONE) (governed cognition).
+
+## Quick Start
+
+```bash
+# Install
+npm install opencode-agent-factory-plugin
+# or
+bun add opencode-agent-factory-plugin
+```
+
+Add to your `opencode.json`:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": ["opencode-agent-factory-plugin"]
+}
+```
+
+Restart OpenCode. Use the `/orchestrate` command:
+
+```
+/orchestrate Design a REST API for a todo app with authentication
+```
+
+## How It Works
+
+For every prompt, the plugin runs a 6-phase pipeline:
+
+```
+User Prompt
+    |
+    v
+[1. ANALYZE]  -- agent-factory determines task type, complexity, domains
+    |
+    v
+[2. PLAN]     -- agent-factory generates specialized agent specs
+    |
+    v
+[3. EXECUTE]  -- execution-engine spawns agents in parallel DAG groups
+    |
+    v
+[4. CONSENSUS]-- consensus-manager unifies outputs via strategy
+    |
+    v
+[5. SYNTHESIZE]-- orchestrator compiles final response
+    |
+    v
+Final Result + Execution Summary
+```
+
+### What Makes This Different From Built-in Sub-Agents
+
+| Feature | Built-in `task` tool | Agent Factory Plugin |
+|---------|---------------------|---------------------|
+| Agent roles | Pre-defined, fixed | Generated per-task at runtime |
+| Parallel execution | Manual | Automatic DAG scheduling |
+| Dependencies | Manual tracking | Automatic injection |
+| Consensus | None | 5 strategies (debate, voting, etc.) |
+| Model selection | Manual | Automatic tier assignment |
+
+## Agents
+
+### dynamic-orchestrator (primary)
+
+Master orchestrator. Analyzes the task, delegates to subagents, synthesizes results. Never does work directly -- always spawns subagents.
+
+### agent-factory
+
+Analyzes task complexity and generates agent specifications. Creates specialized roles, prompts, tool selections, and dependency graphs for each task.
+
+### execution-engine
+
+Executes agent DAGs with parallel group scheduling. Handles dependency injection, timeouts, retries, and failure recovery.
+
+### consensus-manager
+
+Unifies multiple agent outputs using consensus protocols:
+
+| Strategy | When Used | How It Works |
+|----------|-----------|--------------|
+| `single` | Simple tasks, one clear answer | Return primary agent output directly |
+| `debate` | Multiple valid approaches | Multi-round: state, critique, revise, check convergence |
+| `voting` | Discrete options | Weighted votes by expertise, confidence scores |
+| `expert_review` | High-stakes output | Reviewer evaluates all outputs, approves or requests revision |
+| `hierarchical` | Multi-level refinement | Junior, Senior, Lead chain with each level adding value |
+
+## Commands
+
+### /orchestrate
+
+Run the full dynamic orchestration workflow:
+
+```
+/orchestrate <your task description>
+```
+
+### /orchestrate-debug
+
+Same workflow with detailed execution logging and step-by-step verification:
+
+```
+/orchestrate-debug <your task description>
+```
+
+## Configuration
+
+The plugin requires no configuration. It automatically:
+- Injects 4 agents (dynamic-orchestrator, agent-factory, execution-engine, consensus-manager)
+- Injects 2 commands (orchestrate, orchestrate-debug)
+- Sets `dynamic-orchestrator` as the default agent
+
+To override agent settings, add them to your `opencode.json`:
+
+```json
+{
+  "plugin": ["opencode-agent-factory-plugin"],
+  "agent": {
+    "dynamic-orchestrator": {
+      "model": "anthropic/claude-sonnet-4-6"
+    }
+  }
+}
+```
+
+## Consensus Strategies in Detail
+
+### Single
+
+Best for: simple tasks, one agent does the work, no conflict to resolve.
+Returns the primary agent's output directly.
+
+### Debate
+
+Best for: complex reasoning with multiple valid approaches.
+Runs 2-3 rounds: agents state positions, critique each other, revise.
+Checks convergence (similarity > 85%). If diverged, escalates to expert_review.
+
+### Voting
+
+Best for: discrete choices (tech stack, architecture decisions).
+Each agent votes on options with confidence scores.
+Weights votes by agent expertise. Returns highest-scoring option.
+
+### Expert Review
+
+Best for: high-stakes output needing validation.
+Designates a reviewer agent who evaluates all outputs.
+Approves, requests revision, or rejects. Max 2 revision cycles.
+
+### Hierarchical
+
+Best for: multi-level refinement.
+Junior agents draft, senior agents refine, lead agent synthesizes.
+Each level adds value, not just passes through.
+
+## Development
+
+```bash
+git clone https://github.com/MunhozThiago/opencode-agent-factory-plugin.git
+cd opencode-agent-factory-plugin
+bun install
+bun run build
+```
+
+### Local Testing
+
+Add to your `opencode.json`:
+
+```json
+{
+  "plugin": ["./path/to/opencode-agent-factory-plugin"]
+}
+```
+
+### Project Structure
+
+```
+opencode-agent-factory-plugin/
+├── src/
+│   └── index.ts              # Plugin entry point
+├── agents/
+│   ├── dynamic-orchestrator.md
+│   ├── agent-factory.md
+│   ├── execution-engine.md
+│   └── consensus-manager.md
+├── commands/
+│   ├── orchestrate.md
+│   └── orchestrate-debug.md
+├── package.json
+├── tsconfig.json
+└── README.md
+```
+
+## License
+
+AGPL-3.0

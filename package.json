@@ -1,0 +1,47 @@
+{
+  "name": "opencode-agent-factory-plugin",
+  "version": "1.0.0",
+  "description": "Dynamic multi-agent orchestration for OpenCode. Analyzes prompts, generates specialized agents at runtime, executes in parallel with consensus strategies.",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "scripts": {
+    "build": "bun build src/index.ts --outdir dist --target bun",
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "@opencode-ai/plugin": "*"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "latest",
+    "bun-types": "latest",
+    "typescript": "^5.0.0"
+  },
+  "files": [
+    "dist",
+    "agents",
+    "commands",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "multi-agent",
+    "orchestration",
+    "consensus",
+    "parallel-agents",
+    "dynamic-agents"
+  ],
+  "license": "AGPL-3.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/MunhozThiago/opencode-agent-factory-plugin"
+  }
+}
