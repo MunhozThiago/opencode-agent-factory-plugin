@@ -13,7 +13,8 @@
   },
   "scripts": {
     "build": "bun build src/index.ts --outdir dist --target bun",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "bun run build"
   },
   "peerDependencies": {
     "@opencode-ai/plugin": "*"
@@ -37,11 +38,22 @@
     "orchestration",
     "consensus",
     "parallel-agents",
-    "dynamic-agents"
+    "dynamic-agents",
+    "agent-factory",
+    "dag"
   ],
   "license": "AGPL-3.0",
   "repository": {
     "type": "git",
     "url": "https://github.com/MunhozThiago/opencode-agent-factory-plugin"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "opencode": {
+    "name": "Agent Factory",
+    "description": "Dynamic multi-agent orchestration with runtime agent generation and consensus protocols",
+    "minVersion": "0.1.0"
   }
 }

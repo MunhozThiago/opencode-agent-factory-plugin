@@ -1,0 +1,34 @@
+name: opencode-agent-factory
+repo: https://github.com/MunhozThiago/opencode-agent-factory-plugin
+tagline: Dynamic multi-agent orchestration with runtime agent generation and consensus protocols
+description: |
+  Analyzes prompts at runtime, generates specialized agent teams, executes them in parallel with dependency resolution, and synthesizes results using consensus strategies (debate, voting, expert review, hierarchical).
+
+  Features:
+  - Runtime agent generation: no hardcoded models, adapts to your current session
+  - Parallel DAG execution with automatic dependency injection
+  - 5 consensus protocols for reconciling multiple agent outputs
+  - Configurable timeout and retry policies
+  - Built-in /orchestrate command and orchestrate custom tool
+tags:
+  - multi-agent
+  - orchestration
+  - consensus
+  - parallel
+  - dynamic-agents
+  - workflow
+scope:
+  - project
+min_version: "0.1.0"
+homepage: https://github.com/MunhozThiago/opencode-agent-factory-plugin
+installation: |
+  ```bash
+  npm install opencode-agent-factory-plugin
+  ```
+  Add to your `opencode.json`:
+  ```json
+  {
+    "plugin": ["opencode-agent-factory-plugin"]
+  }
+  ```
+  Use via the `/orchestrate` command or the `orchestrate` tool.

@@ -28,6 +28,12 @@ Restart OpenCode. Use the `/orchestrate` command:
 /orchestrate Design a REST API for a todo app with authentication
 ```
 
+Or call the `orchestrate` tool directly from any agent:
+
+```
+Use the orchestrate tool to: Design a REST API for a todo app with authentication
+```
+
 ## How It Works
 
 For every prompt, the plugin runs a 6-phase pipeline:
@@ -108,12 +114,24 @@ Same workflow with detailed execution logging and step-by-step verification:
 /orchestrate-debug <your task description>
 ```
 
+## Custom Tool
+
+The plugin registers an `orchestrate` tool that any agent can call:
+
+```
+orchestrate(prompt="Build a React component", strategy="debate")
+```
+
+Parameters:
+- `prompt` (required): The task to orchestrate
+- `strategy` (optional): Consensus strategy override (auto, single, debate, voting, expert_review, hierarchical)
+
 ## Configuration
 
 The plugin requires no configuration. It automatically:
-- Injects 4 agents (dynamic-orchestrator, agent-factory, execution-engine, consensus-manager)
-- Injects 2 commands (orchestrate, orchestrate-debug)
-- Sets `dynamic-orchestrator` as the default agent
+- Registers the `orchestrate` custom tool
+- Loads 4 agent definitions (dynamic-orchestrator, agent-factory, execution-engine, consensus-manager)
+- Logs orchestration events via the OpenCode SDK
 
 To override agent settings, add them to your `opencode.json`:
 
@@ -183,7 +201,7 @@ Add to your `opencode.json`:
 ```
 opencode-agent-factory-plugin/
 ├── src/
-│   └── index.ts              # Plugin entry point
+│   └── index.ts              # Plugin entry point (orchestrate tool + hooks)
 ├── agents/
 │   ├── dynamic-orchestrator.md
 │   ├── agent-factory.md
@@ -192,10 +210,32 @@ opencode-agent-factory-plugin/
 ├── commands/
 │   ├── orchestrate.md
 │   └── orchestrate-debug.md
+├── .github/workflows/
+│   ├── ci.yml                # Build on push/PR
+│   └── release.yml           # npm publish on tag
 ├── package.json
 ├── tsconfig.json
 └── README.md
 ```
+
+## Publishing
+
+```bash
+# Tag a release
+git tag v1.0.0
+git push origin v1.0.0
+
+# GitHub Action will:
+# 1. Build the plugin
+# 2. Create a GitHub Release
+# 3. Publish to npm with provenance
+```
+
+## Community
+
+This plugin is listed in:
+- [awesome-opencode](https://github.com/awesome-opencode/awesome-opencode) - Curated list of OpenCode plugins
+- [OpenCode Ecosystem](https://opencode.ai/docs/ecosystem/) - Official ecosystem page
 
 ## License
 
