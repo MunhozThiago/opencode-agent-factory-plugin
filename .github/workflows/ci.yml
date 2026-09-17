@@ -19,4 +19,7 @@ jobs:
       - run: bun run build
 
       - name: Check types
-        run: bun run typecheck || true
+        run: bun run typecheck
+
+      - name: Run tests
+        run: bun test

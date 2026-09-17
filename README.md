@@ -36,25 +36,25 @@ Use the orchestrate tool to: Design a REST API for a todo app with authenticatio
 
 ## How It Works
 
-For every prompt, the plugin runs a 6-phase pipeline:
+The plugin runs a 5-phase pipeline using OpenCode's SDK to spawn real child sessions:
 
 ```
 User Prompt
     |
     v
-[1. ANALYZE]  -- agent-factory determines task type, complexity, domains
+[1. ANALYZE]  -- agent-factory analyzes task, outputs structured task analysis JSON
     |
     v
-[2. PLAN]     -- agent-factory generates specialized agent specs
+[2. PLAN]     -- agent-factory generates agent specifications (roles, prompts, tools, deps)
     |
     v
-[3. EXECUTE]  -- execution-engine spawns agents in parallel DAG groups
+[3. EXECUTE]  -- execution-engine spawns agents in parallel groups via SDK sessions
     |
     v
-[4. CONSENSUS]-- consensus-manager unifies outputs via strategy
+[4. CONSENSUS]-- consensus-manager unifies outputs via selected strategy
     |
     v
-[5. SYNTHESIZE]-- orchestrator compiles final response
+[5. SYNTHESIZE]-- dynamic-orchestrator compiles final response
     |
     v
 Final Result + Execution Summary
@@ -65,8 +65,8 @@ Final Result + Execution Summary
 | Feature | Built-in `task` tool | Agent Factory Plugin |
 |---------|---------------------|---------------------|
 | Agent roles | Pre-defined, fixed | Generated per-task at runtime |
-| Parallel execution | Manual | Automatic DAG scheduling |
-| Dependencies | Manual tracking | Automatic injection |
+| Parallel execution | Manual | Automatic DAG scheduling via SDK |
+| Dependencies | Manual tracking | Automatic injection between groups |
 | Consensus | None | 5 strategies (debate, voting, etc.) |
 | Model selection | Manual | Automatic tier assignment |
 
@@ -74,15 +74,15 @@ Final Result + Execution Summary
 
 ### dynamic-orchestrator (primary)
 
-Master orchestrator. Analyzes the task, delegates to subagents, synthesizes results. Never does work directly -- always spawns subagents.
+Master orchestrator. Analyzes the task, delegates to subagents via SDK session.create/prompt, synthesizes results. Never does work directly -- always spawns subagents.
 
 ### agent-factory
 
-Analyzes task complexity and generates agent specifications. Creates specialized roles, prompts, tool selections, and dependency graphs for each task.
+Analyzes task complexity and generates agent specifications. Creates specialized roles, prompts, tool selections, and dependency graphs for each task. Runs in two modes: ANALYZE (phase 1) and PLAN (phase 2).
 
 ### execution-engine
 
-Executes agent DAGs with parallel group scheduling. Handles dependency injection, timeouts, retries, and failure recovery.
+Executes agent DAGs with parallel group scheduling. Spawns agents via SDK sessions in parallel groups, handles dependency injection, timeouts, retries, and failure recovery. Outputs structured execution results.
 
 ### consensus-manager
 
@@ -201,7 +201,9 @@ Add to your `opencode.json`:
 ```
 opencode-agent-factory-plugin/
 ├── src/
-│   └── index.ts              # Plugin entry point (orchestrate tool + hooks)
+│   ├── index.ts              # Plugin entry point (orchestrate tool + hooks)
+│   ├── orchestrator.ts       # 5-phase SDK-driven orchestration engine
+│   └── index.test.ts         # Unit tests
 ├── agents/
 │   ├── dynamic-orchestrator.md
 │   ├── agent-factory.md
@@ -211,7 +213,7 @@ opencode-agent-factory-plugin/
 │   ├── orchestrate.md
 │   └── orchestrate-debug.md
 ├── .github/workflows/
-│   ├── ci.yml                # Build on push/PR
+│   ├── ci.yml                # Build, typecheck, test on push/PR
 │   └── release.yml           # npm publish on tag
 ├── package.json
 ├── tsconfig.json
@@ -227,8 +229,9 @@ git push origin v1.0.0
 
 # GitHub Action will:
 # 1. Build the plugin
-# 2. Create a GitHub Release
-# 3. Publish to npm with provenance
+# 2. Run typecheck and tests
+# 3. Create a GitHub Release
+# 4. Publish to npm with provenance
 ```
 
 ## Community
