@@ -34,7 +34,7 @@ export const AgentFactoryPlugin: Plugin = async ({ project, client, $, directory
       service: "agent-factory",
       level: "info",
       message: "Agent Factory plugin loaded",
-      extra: { project: project?.name ?? "unknown" },
+      extra: { project: project?.id ?? "unknown" },
     },
   })
 
@@ -44,14 +44,11 @@ export const AgentFactoryPlugin: Plugin = async ({ project, client, $, directory
         description:
           "Run a dynamic multi-agent workflow. Analyzes the prompt, generates specialized agents at runtime, executes them in parallel with dependency resolution, and synthesizes results using consensus strategies.",
         args: {
-          prompt: tool.schema.string({
-            description: "The task to orchestrate across multiple agents",
-          }),
+          prompt: tool.schema.string().describe("The task to orchestrate across multiple agents"),
           strategy: tool.schema.optional(
-            tool.schema.string({
-              description:
-                "Consensus strategy: auto (default), single, debate, voting, expert_review, hierarchical",
-            })
+            tool.schema.string().describe(
+              "Consensus strategy: auto (default), single, debate, voting, expert_review, hierarchical"
+            )
           ),
         },
         async execute(args, context) {
@@ -102,12 +99,13 @@ Use the \`task\` tool to spawn each phase as a subagent.
       }),
     },
 
-    "session.idle": async (input, output) => {
+    event: async ({ event }) => {
+      if (event.type !== "session.idle") return
       await client.app.log({
         body: {
           service: "agent-factory",
           level: "debug",
-          message: `Session ${input.sessionID} idle`,
+          message: `Session ${event.properties.sessionID} idle`,
         },
       })
     },
