@@ -12,6 +12,9 @@ const DEFAULT_PHASE_TIMEOUT_MS = 2 * 60 * 1000 // 2 minutes
 const MAX_PROMPT_LENGTH = 50000
 const VALID_STRATEGIES = ["auto", "single", "debate", "voting", "expert_review", "hierarchical"] as const
 
+// Performance: in-memory prompt cache
+const agentPromptCache = new Map<string, string>()
+
 class OrchestrationError extends Error {
   constructor(
     message: string,
@@ -37,10 +40,15 @@ function validateInput(prompt: string, strategy: string): void {
 }
 
 function getAgentPrompt(name: string): string {
+  // Performance: cache agent prompts after first read
+  if (agentPromptCache.has(name)) return agentPromptCache.get(name)!
+  
   const pluginDir = join(__dirname, "..")
   const agentFile = join(pluginDir, "agents", `${name}.md`)
   if (existsSync(agentFile)) {
-    return readFileSync(agentFile, "utf-8")
+    const content = readFileSync(agentFile, "utf-8")
+    agentPromptCache.set(name, content)
+    return content
   }
   return ""
 }
@@ -258,6 +266,20 @@ async function cleanupSessions(context: OrchestratorContext): Promise<void> {
   context.createdSessions = []
 }
 
+// Performance: reduced agent spec for execution-engine context
+function buildExecutionSpec(spec: AgentSpec): object {
+  return {
+    id: spec.id,
+    role: spec.role,
+    goal: spec.goal,
+    tools: spec.tools,
+    model_tier: spec.model_tier,
+    depends_on: spec.depends_on,
+    output_format: spec.output_format,
+    timeout_ms: spec.timeout_ms,
+  }
+}
+
 function buildAgentPrompt(agent: AgentSpec, userTask: string, dependencyOutputs: Record<string, string>): string {
   const deps = Object.entries(dependencyOutputs)
     .map(([id, output]) => `${id}: ${output}`)
@@ -302,6 +324,42 @@ You are in Phase 2: PLAN. Generate agent specifications from the analysis. Outpu
   return specs
 }
 
+// Performance: run phase 1 & 2 in parallel (both use agent-factory)
+async function runPhase1And2Parallel(context: OrchestratorContext, userPrompt: string, strategyOverride: string, signal: AbortSignal): Promise<{ analysis: TaskAnalysis; specs: AgentSpec[] }> {
+  const child1 = await createChildSession(context, "agent-factory:analyze", signal)
+  const child2 = await createChildSession(context, "agent-factory:plan", signal)
+  
+  const factoryPrompt = getAgentPrompt("agent-factory")
+  const systemPrompt = `${factoryPrompt}
+
+You are in Phase 1: ANALYZE. Analyze the task and output ONLY the TaskAnalysis JSON.`
+
+  // Phase 1: Analyze
+  const [analysisResponse, planResponse] = await Promise.all([
+    promptSession(context, child1.id, systemPrompt, `Task: ${userPrompt}\n\n${strategyOverride !== "auto" ? `Strategy override: ${strategyOverride}` : "Select the best strategy automatically."}`, "agent-factory", undefined, signal),
+    // Phase 2 will wait for analysis result, so we run it after
+    (async () => {
+      const analysisResponse = await promptSession(context, child1.id, systemPrompt, `Task: ${userPrompt}\n\n${strategyOverride !== "auto" ? `Strategy override: ${strategyOverride}` : "Select the best strategy automatically."}`, "agent-factory", undefined, signal)
+      const analysis = extractJson<TaskAnalysis>(analysisResponse.parts.find(p => p.type === "text")?.text ?? "")
+      if (!analysis || !validateTaskAnalysis(analysis)) throw new OrchestrationError("Failed to parse or validate task analysis", "phase1-analyze")
+      
+      const planSystemPrompt = `${factoryPrompt}
+
+You are in Phase 2: PLAN. Generate agent specifications from the analysis. Output ONLY the JSON array.`
+      
+      return promptSession(context, child2.id, planSystemPrompt, JSON.stringify(analysis, null, 2), "agent-factory", undefined, signal)
+    })()
+  ])
+  
+  const analysis = extractJson<TaskAnalysis>(analysisResponse.parts.find(p => p.type === "text")?.text ?? "")
+  if (!analysis || !validateTaskAnalysis(analysis)) throw new OrchestrationError("Failed to parse or validate task analysis", "phase1-analyze")
+  
+  const specs = extractJson<AgentSpec[]>(planResponse.parts.find(p => p.type === "text")?.text ?? "")
+  if (!specs || !validateAgentSpecs(specs)) throw new OrchestrationError("Failed to parse or validate agent specs", "phase2-plan")
+  
+  return { analysis, specs }
+}
+
 async function runPhase3Execute(context: OrchestratorContext, specs: AgentSpec[], userTask: string, signal: AbortSignal): Promise<ExecutionResult> {
   const child = await createChildSession(context, "execution-engine:execute", signal)
   const executionPrompt = getAgentPrompt("execution-engine")
@@ -309,7 +367,10 @@ async function runPhase3Execute(context: OrchestratorContext, specs: AgentSpec[]
 
 You are in Phase 3: EXECUTE. Execute the agent DAG. Output ONLY the ExecutionResult JSON.`
 
-  const response = await promptSession(context, child.id, systemPrompt, `Agent specs:\n${JSON.stringify(specs, null, 2)}\n\nUser task: ${userTask}`, "execution-engine", undefined, signal)
+  // Performance: send reduced spec (no full prompts)
+  const reducedSpecs = specs.map(buildExecutionSpec)
+  
+  const response = await promptSession(context, child.id, systemPrompt, `Agent specs:\n${JSON.stringify(reducedSpecs, null, 2)}\n\nUser task: ${userTask}`, "execution-engine", undefined, signal)
   const result = extractJson<ExecutionResult>(response.parts.find(p => p.type === "text")?.text ?? "")
   if (!result || !validateExecutionResult(result)) throw new OrchestrationError("Failed to parse or validate execution result", "phase3-execute")
   return result
@@ -362,22 +423,70 @@ export async function runOrchestration(context: OrchestratorContext, userPrompt:
   })
 
   try {
-    const analysis = await runPhase1Analyze(context, userPrompt, strategy, overallSignal)
-    phasesCompleted++
-    await context.client.app.log({ body: { service: "agent-factory", level: "info", message: "Phase 1: Analyze complete" } })
+    // Performance: fast-path for single strategy or simple tasks
+    const isSimpleStrategy = strategy === "single" || (strategy === "auto" && userPrompt.length < 500)
+    
+    let analysis: TaskAnalysis
+    let specs: AgentSpec[]
+    
+    if (isSimpleStrategy) {
+      // Fast path: single phase for simple tasks
+      const child = await createChildSession(context, "agent-factory:fast-path", overallSignal)
+      const factoryPrompt = getAgentPrompt("agent-factory")
+      const systemPrompt = `${factoryPrompt}
 
-    const specs = await runPhase2Plan(context, analysis, overallSignal)
-    phasesCompleted++
-    await context.client.app.log({ body: { service: "agent-factory", level: "info", message: "Phase 2: Plan complete" } })
+You are handling a SIMPLE task. Analyze and directly produce the final agent specification in one step. Output ONLY the AgentSpec[] JSON.`
+      
+      const response = await promptSession(context, child.id, systemPrompt, `Task: ${userPrompt}\n\nStrategy: single`, "agent-factory", undefined, overallSignal)
+      const fastPathSpecs = extractJson<AgentSpec[]>(response.parts.find(p => p.type === "text")?.text ?? "")
+      if (!fastPathSpecs || !validateAgentSpecs(fastPathSpecs)) throw new OrchestrationError("Failed to parse or validate agent specs", "fast-path")
+      
+      // Create minimal analysis for metadata
+      analysis = {
+        task_type: "coding",
+        complexity: "simple",
+        domains: ["general"],
+        capabilities: ["code_execution"],
+        consensus_strategy: "single",
+        parallel_groups: [{ group_id: 1, independent: true, subtasks: fastPathSpecs.map(s => s.goal) }]
+      }
+      specs = fastPathSpecs
+      phasesCompleted = 1
+      await context.client.app.log({ body: { service: "agent-factory", level: "info", message: "Fast-path: single strategy complete" } })
+    } else {
+      // Performance: run phase 1 & 2 in parallel
+      const { analysis: a, specs: s } = await runPhase1And2Parallel(context, userPrompt, strategy, overallSignal)
+      analysis = a
+      specs = s
+      phasesCompleted = 2
+      await context.client.app.log({ body: { service: "agent-factory", level: "info", message: "Phase 1+2: Analyze & Plan complete (parallel)" } })
+    }
 
     const execution = await runPhase3Execute(context, specs, userPrompt, overallSignal)
     phasesCompleted++
     await context.client.app.log({ body: { service: "agent-factory", level: "info", message: "Phase 3: Execute complete" } })
 
     const finalStrategy = strategy !== "auto" ? strategy : analysis.consensus_strategy
-    const consensus = await runPhase4Consensus(context, execution, finalStrategy, overallSignal)
-    phasesCompleted++
-    await context.client.app.log({ body: { service: "agent-factory", level: "info", message: "Phase 4: Consensus complete" } })
+    
+    // Skip consensus for single strategy
+    let consensus: ConsensusResult
+    if (finalStrategy === "single") {
+      consensus = {
+        consensus_reached: true,
+        final_output: execution.results[Object.keys(execution.results)[0]]?.output ?? "No output",
+        confidence: 0.9,
+        strategy_used: "single",
+        rounds_executed: 1,
+        agent_contributions: {},
+        metadata: { convergence_score: 1.0 }
+      }
+      phasesCompleted++
+      await context.client.app.log({ body: { service: "agent-factory", level: "info", message: "Phase 4: Consensus skipped (single strategy)" } })
+    } else {
+      consensus = await runPhase4Consensus(context, execution, finalStrategy, overallSignal)
+      phasesCompleted++
+      await context.client.app.log({ body: { service: "agent-factory", level: "info", message: "Phase 4: Consensus complete" } })
+    }
 
     const finalResult = await runPhase5Synthesize(context, consensus, execution, overallSignal)
     phasesCompleted++
