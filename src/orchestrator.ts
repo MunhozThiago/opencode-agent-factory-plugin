@@ -229,13 +229,12 @@ async function createChildSession(context: OrchestratorContext, title: string, s
   return session
 }
 
-async function promptSession(context: OrchestratorContext, sessionId: string, systemPrompt: string, userPrompt: string, agent?: string, tools?: Record<string, boolean>, signal?: AbortSignal) {
+async function promptSession(context: OrchestratorContext, sessionId: string, systemPrompt: string, userPrompt: string, tools?: Record<string, boolean>, signal?: AbortSignal) {
   checkAbort(signal ?? context.abort, "promptSession")
   const response = await withRetry(async () => {
     return context.client.session.prompt({
       path: { id: sessionId },
       body: {
-        agent,
         system: systemPrompt,
         parts: [{ type: "text", text: userPrompt }],
         tools,
@@ -305,7 +304,7 @@ async function runPhase1Analyze(context: OrchestratorContext, userPrompt: string
 
 You are in Phase 1: ANALYZE. Analyze the task and output ONLY the TaskAnalysis JSON.`
 
-  const response = await promptSession(context, child.id, systemPrompt, `Task: ${userPrompt}\n\n${strategyOverride !== "auto" ? `Strategy override: ${strategyOverride}` : "Select the best strategy automatically."}`, "agent-factory", undefined, signal)
+  const response = await promptSession(context, child.id, systemPrompt, `Task: ${userPrompt}\n\n${strategyOverride !== "auto" ? `Strategy override: ${strategyOverride}` : "Select the best strategy automatically."}`, undefined, signal)
   const analysis = extractJson<TaskAnalysis>(response.parts.find(p => p.type === "text")?.text ?? "")
   if (!analysis || !validateTaskAnalysis(analysis)) throw new OrchestrationError("Failed to parse or validate task analysis", "phase1-analyze")
   return analysis
@@ -318,7 +317,7 @@ async function runPhase2Plan(context: OrchestratorContext, analysis: TaskAnalysi
 
 You are in Phase 2: PLAN. Generate agent specifications from the analysis. Output ONLY the JSON array.`
 
-  const response = await promptSession(context, child.id, systemPrompt, JSON.stringify(analysis, null, 2), "agent-factory", undefined, signal)
+  const response = await promptSession(context, child.id, systemPrompt, JSON.stringify(analysis, null, 2), undefined, signal)
   const specs = extractJson<AgentSpec[]>(response.parts.find(p => p.type === "text")?.text ?? "")
   if (!specs || !validateAgentSpecs(specs)) throw new OrchestrationError("Failed to parse or validate agent specs", "phase2-plan")
   return specs
@@ -336,10 +335,10 @@ You are in Phase 1: ANALYZE. Analyze the task and output ONLY the TaskAnalysis J
 
   // Phase 1: Analyze
   const [analysisResponse, planResponse] = await Promise.all([
-    promptSession(context, child1.id, systemPrompt, `Task: ${userPrompt}\n\n${strategyOverride !== "auto" ? `Strategy override: ${strategyOverride}` : "Select the best strategy automatically."}`, "agent-factory", undefined, signal),
+    promptSession(context, child1.id, systemPrompt, `Task: ${userPrompt}\n\n${strategyOverride !== "auto" ? `Strategy override: ${strategyOverride}` : "Select the best strategy automatically."}`, undefined, signal),
     // Phase 2 will wait for analysis result, so we run it after
     (async () => {
-      const analysisResponse = await promptSession(context, child1.id, systemPrompt, `Task: ${userPrompt}\n\n${strategyOverride !== "auto" ? `Strategy override: ${strategyOverride}` : "Select the best strategy automatically."}`, "agent-factory", undefined, signal)
+      const analysisResponse = await promptSession(context, child1.id, systemPrompt, `Task: ${userPrompt}\n\n${strategyOverride !== "auto" ? `Strategy override: ${strategyOverride}` : "Select the best strategy automatically."}`, undefined, signal)
       const analysis = extractJson<TaskAnalysis>(analysisResponse.parts.find(p => p.type === "text")?.text ?? "")
       if (!analysis || !validateTaskAnalysis(analysis)) throw new OrchestrationError("Failed to parse or validate task analysis", "phase1-analyze")
       
@@ -347,7 +346,7 @@ You are in Phase 1: ANALYZE. Analyze the task and output ONLY the TaskAnalysis J
 
 You are in Phase 2: PLAN. Generate agent specifications from the analysis. Output ONLY the JSON array.`
       
-      return promptSession(context, child2.id, planSystemPrompt, JSON.stringify(analysis, null, 2), "agent-factory", undefined, signal)
+      return promptSession(context, child2.id, planSystemPrompt, JSON.stringify(analysis, null, 2), undefined, signal)
     })()
   ])
   
@@ -370,7 +369,7 @@ You are in Phase 3: EXECUTE. Execute the agent DAG. Output ONLY the ExecutionRes
   // Performance: send reduced spec (no full prompts)
   const reducedSpecs = specs.map(buildExecutionSpec)
   
-  const response = await promptSession(context, child.id, systemPrompt, `Agent specs:\n${JSON.stringify(reducedSpecs, null, 2)}\n\nUser task: ${userTask}`, "execution-engine", undefined, signal)
+  const response = await promptSession(context, child.id, systemPrompt, `Agent specs:\n${JSON.stringify(reducedSpecs, null, 2)}\n\nUser task: ${userTask}`, undefined, signal)
   const result = extractJson<ExecutionResult>(response.parts.find(p => p.type === "text")?.text ?? "")
   if (!result || !validateExecutionResult(result)) throw new OrchestrationError("Failed to parse or validate execution result", "phase3-execute")
   return result
@@ -383,7 +382,7 @@ async function runPhase4Consensus(context: OrchestratorContext, executionResult:
 
 You are in Phase 4: CONSENSUS. Apply the consensus strategy. Output ONLY the ConsensusResult JSON.`
 
-  const response = await promptSession(context, child.id, systemPrompt, `Strategy: ${strategy}\nAgent outputs:\n${JSON.stringify(executionResult.results, null, 2)}`, "consensus-manager", undefined, signal)
+  const response = await promptSession(context, child.id, systemPrompt, `Strategy: ${strategy}\nAgent outputs:\n${JSON.stringify(executionResult.results, null, 2)}`, undefined, signal)
   const result = extractJson<ConsensusResult>(response.parts.find(p => p.type === "text")?.text ?? "")
   if (!result || !validateConsensusResult(result)) throw new OrchestrationError("Failed to parse or validate consensus result", "phase4-consensus")
   return result
@@ -396,7 +395,7 @@ async function runPhase5Synthesize(context: OrchestratorContext, consensus: Cons
 
 You are in Phase 5: SYNTHESIZE. Compile the final response using the consensus output. Output ONLY the final answer.`
 
-  const response = await promptSession(context, child.id, systemPrompt, `Consensus result:\n${JSON.stringify(consensus, null, 2)}\n\nExecution metadata:\n${JSON.stringify(executionResult.execution_metadata, null, 2)}`, "dynamic-orchestrator", undefined, signal)
+  const response = await promptSession(context, child.id, systemPrompt, `Consensus result:\n${JSON.stringify(consensus, null, 2)}\n\nExecution metadata:\n${JSON.stringify(executionResult.execution_metadata, null, 2)}`, undefined, signal)
   return response.parts.find(p => p.type === "text")?.text ?? "No result produced"
 }
 
@@ -437,7 +436,7 @@ export async function runOrchestration(context: OrchestratorContext, userPrompt:
 
 You are handling a SIMPLE task. Analyze and directly produce the final agent specification in one step. Output ONLY the AgentSpec[] JSON.`
       
-      const response = await promptSession(context, child.id, systemPrompt, `Task: ${userPrompt}\n\nStrategy: single`, "agent-factory", undefined, overallSignal)
+      const response = await promptSession(context, child.id, systemPrompt, `Task: ${userPrompt}\n\nStrategy: single`, undefined, overallSignal)
       const fastPathSpecs = extractJson<AgentSpec[]>(response.parts.find(p => p.type === "text")?.text ?? "")
       if (!fastPathSpecs || !validateAgentSpecs(fastPathSpecs)) throw new OrchestrationError("Failed to parse or validate agent specs", "fast-path")
       
