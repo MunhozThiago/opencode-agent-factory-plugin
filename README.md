@@ -126,12 +126,51 @@ Parameters:
 - `prompt` (required): The task to orchestrate
 - `strategy` (optional): Consensus strategy override (auto, single, debate, voting, expert_review, hierarchical)
 
+## Telemetry
+
+The plugin tracks orchestration metrics automatically. Use the `telemetry` tool to query:
+
+```
+telemetry(action="snapshot")   # View all metrics
+telemetry(action="reset")      # Reset metrics
+telemetry(action="session")    # View persisted session info
+telemetry(action="cleanup")    # Clean old sessions
+```
+
+Metrics include: total orchestrations, success/failure rates, average execution time, strategy usage, and per-phase timing breakdowns.
+
 ## Configuration
 
-The plugin requires no configuration. It automatically:
-- Registers the `orchestrate` custom tool
-- Loads 4 agent definitions (dynamic-orchestrator, agent-factory, execution-engine, consensus-manager)
-- Logs orchestration events via the OpenCode SDK
+Configure the plugin via `opencode.json`:
+
+```json
+{
+  "plugin": ["opencode-agent-factory-plugin"],
+  "option": {
+    "opencode-agent-factory-plugin": {
+      "overallTimeoutMs": 300000,
+      "phaseTimeoutMs": 120000,
+      "maxRetries": 2,
+      "baseRetryDelayMs": 1000,
+      "enableProgress": true,
+      "fastPathThresholdChars": 500,
+      "defaultStrategy": "auto"
+    }
+  }
+}
+```
+
+### Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `overallTimeoutMs` | `300000` (5min) | Max total orchestration time |
+| `phaseTimeoutMs` | `120000` (2min) | Max time per phase |
+| `maxRetries` | `2` | Retry count for failed agents |
+| `baseRetryDelayMs` | `1000` | Base delay for exponential backoff |
+| `enableProgress` | `true` | Stream progress events |
+| `fastPathThresholdChars` | `500` | Prompt length below which fast-path is used |
+| `defaultStrategy` | `"auto"` | Default consensus strategy |
 
 To override agent settings, add them to your `opencode.json`:
 

@@ -38,6 +38,139 @@ function getOptions(options?: PluginOptions): AgentFactoryPluginOptions {
 // Performance: in-memory prompt cache
 const agentPromptCache = new Map<string, string>()
 
+// Telemetry: in-memory metrics collector
+interface TelemetryMetrics {
+  totalOrchestrations: number
+  successfulOrchestrations: number
+  failedOrchestrations: number
+  totalAgentsSpawned: number
+  totalExecutionTimeMs: number
+  phaseTimings: Record<string, number[]>
+  strategyUsage: Record<string, number>
+  fastPathUsage: number
+  complexPathUsage: number
+}
+
+const telemetryMetrics: TelemetryMetrics = {
+  totalOrchestrations: 0,
+  successfulOrchestrations: 0,
+  failedOrchestrations: 0,
+  totalAgentsSpawned: 0,
+  totalExecutionTimeMs: 0,
+  phaseTimings: {},
+  strategyUsage: {},
+  fastPathUsage: 0,
+  complexPathUsage: 0,
+}
+
+function recordTelemetry(event: {
+  type: "orchestration_start" | "orchestration_complete" | "orchestration_failed"
+  phase?: string
+  strategy?: string
+  durationMs?: number
+  agentsSpawned?: number
+  fastPath?: boolean
+}): void {
+  telemetryMetrics.totalOrchestrations++
+  
+  if (event.type === "orchestration_complete") {
+    telemetryMetrics.successfulOrchestrations++
+    telemetryMetrics.totalExecutionTimeMs += event.durationMs || 0
+    if (event.agentsSpawned) telemetryMetrics.totalAgentsSpawned += event.agentsSpawned
+    if (event.strategy) telemetryMetrics.strategyUsage[event.strategy] = (telemetryMetrics.strategyUsage[event.strategy] || 0) + 1
+    if (event.fastPath) telemetryMetrics.fastPathUsage++
+    else telemetryMetrics.complexPathUsage++
+  } else if (event.type === "orchestration_failed") {
+    telemetryMetrics.failedOrchestrations++
+  }
+  
+  if (event.phase && event.durationMs) {
+    if (!telemetryMetrics.phaseTimings[event.phase]) telemetryMetrics.phaseTimings[event.phase] = []
+    telemetryMetrics.phaseTimings[event.phase].push(event.durationMs)
+  }
+}
+
+function getTelemetrySnapshot(): TelemetryMetrics & { avgExecutionTimeMs: number; avgAgentsPerOrchestration: number } {
+  const avgExecutionTimeMs = telemetryMetrics.successfulOrchestrations > 0 
+    ? telemetryMetrics.totalExecutionTimeMs / telemetryMetrics.successfulOrchestrations 
+    : 0
+  const avgAgentsPerOrchestration = telemetryMetrics.successfulOrchestrations > 0
+    ? telemetryMetrics.totalAgentsSpawned / telemetryMetrics.successfulOrchestrations
+    : 0
+    
+  return {
+    ...telemetryMetrics,
+    avgExecutionTimeMs: Math.round(avgExecutionTimeMs),
+    avgAgentsPerOrchestration: Math.round(avgAgentsPerOrchestration * 100) / 100,
+  }
+}
+
+function resetTelemetry(): void {
+  telemetryMetrics.totalOrchestrations = 0
+  telemetryMetrics.successfulOrchestrations = 0
+  telemetryMetrics.failedOrchestrations = 0
+  telemetryMetrics.totalAgentsSpawned = 0
+  telemetryMetrics.totalExecutionTimeMs = 0
+  telemetryMetrics.phaseTimings = {}
+  telemetryMetrics.strategyUsage = {}
+  telemetryMetrics.fastPathUsage = 0
+  telemetryMetrics.complexPathUsage = 0
+}
+
+// Session persistence: store orchestrator state for reuse
+interface PersistedSession {
+  sessionId: string
+  createdAt: number
+  lastUsed: number
+  orchestrations: number
+  contextSnapshot: {
+    projectId: string
+    directory: string
+    worktree: string
+  }
+}
+
+// In-memory session store (could be persisted to disk)
+const sessionStore = new Map<string, PersistedSession>()
+
+function getOrCreateSession(context: OrchestratorContext): string {
+  const key = `${context.project.id}:${context.directory}`
+  let session = sessionStore.get(key)
+  
+  if (!session) {
+    session = {
+      sessionId: `orchestrator-${context.project.id}-${Date.now()}`,
+      createdAt: Date.now(),
+      lastUsed: Date.now(),
+      orchestrations: 0,
+      contextSnapshot: {
+        projectId: context.project.id,
+        directory: context.directory,
+        worktree: context.worktree,
+      },
+    }
+    sessionStore.set(key, session)
+  }
+  
+  session.lastUsed = Date.now()
+  session.orchestrations++
+  return session.sessionId
+}
+
+function getSessionInfo(context: OrchestratorContext): PersistedSession | null {
+  const key = `${context.project.id}:${context.directory}`
+  return sessionStore.get(key) || null
+}
+
+function cleanupOldSessions(maxAgeMs = 24 * 60 * 60 * 1000): void {
+  const now = Date.now()
+  for (const [key, session] of sessionStore.entries()) {
+    if (now - session.lastUsed > maxAgeMs) {
+      sessionStore.delete(key)
+    }
+  }
+}
+
 interface ProgressEvent {
   phase: string
   step: string
@@ -466,9 +599,9 @@ async function runNativeDAGExecution(
             output,
             error: null,
             duration_ms: durationMs,
-}
-    }
-  } catch (error) {
+          }
+        }
+      } catch (error) {
         const durationMs = Date.now() - agentStartTime
         failed++
         
@@ -639,25 +772,42 @@ export async function runOrchestration(context: OrchestratorContext, userPrompt:
   
   const overallSignal = createTimeoutSignal(context.options.overallTimeoutMs, context.abort)
   const startTime = Date.now()
-
+  
+  // Get or create persisted session
+  const sessionId = getOrCreateSession(context)
+  
   emitProgress(context, {
     phase: "init",
     step: "starting",
     progress: 0,
     message: "Starting orchestration pipeline",
-    metadata: { totalPhases: 5 }
+    metadata: { totalPhases: 5, sessionId }
   })
 
   try {
     // Performance: fast-path for single strategy or simple tasks
     const isSimpleStrategy = strategy === "single" || (strategy === "auto" && userPrompt.length < context.options.fastPathThresholdChars)
     
+    let result
     if (isSimpleStrategy) {
-      return runFastPath(context, userPrompt, overallSignal, startTime)
+      result = await runFastPath(context, userPrompt, overallSignal, startTime)
     } else {
-      return runComplexPath(context, userPrompt, strategy, overallSignal, startTime)
+      result = await runComplexPath(context, userPrompt, strategy, overallSignal, startTime)
     }
+    
+    // Record telemetry
+    const durationMs = Date.now() - startTime
+    recordTelemetry({
+      type: "orchestration_complete",
+      strategy: result.metadata.consensus_strategy,
+      durationMs,
+      agentsSpawned: result.metadata.agents_spawned,
+      fastPath: result.metadata.phases_completed === 1,
+    })
+    
+    return result
   } catch (error) {
+    recordTelemetry({ type: "orchestration_failed", durationMs: Date.now() - startTime })
     await cleanupSessions(context)
     throw error
   }
@@ -981,3 +1131,7 @@ Please try again or contact support.`
     }
   }
 }
+
+// Top-level exports
+export { getTelemetrySnapshot, resetTelemetry, getSessionInfo, cleanupOldSessions }
+export type { TelemetryMetrics, PersistedSession }
