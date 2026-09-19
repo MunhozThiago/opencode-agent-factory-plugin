@@ -1,4 +1,4 @@
-import type { PluginInput } from "@opencode-ai/plugin"
+import type { PluginInput, PluginOptions } from "@opencode-ai/plugin"
 import { tool } from "@opencode-ai/plugin"
 import { readFileSync, existsSync, readdirSync } from "fs"
 import { join, dirname } from "path"
@@ -11,6 +11,29 @@ const DEFAULT_OVERALL_TIMEOUT_MS = 5 * 60 * 1000 // 5 minutes
 const DEFAULT_PHASE_TIMEOUT_MS = 2 * 60 * 1000 // 2 minutes
 const MAX_PROMPT_LENGTH = 50000
 const VALID_STRATEGIES = ["auto", "single", "debate", "voting", "expert_review", "hierarchical"] as const
+
+// Plugin configuration options
+interface AgentFactoryPluginOptions {
+  overallTimeoutMs: number
+  phaseTimeoutMs: number
+  maxRetries: number
+  baseRetryDelayMs: number
+  enableProgress: boolean
+  fastPathThresholdChars: number
+  defaultStrategy: typeof VALID_STRATEGIES[number]
+}
+
+function getOptions(options?: PluginOptions): AgentFactoryPluginOptions {
+  return {
+    overallTimeoutMs: (options?.overallTimeoutMs as number) ?? DEFAULT_OVERALL_TIMEOUT_MS,
+    phaseTimeoutMs: (options?.phaseTimeoutMs as number) ?? DEFAULT_PHASE_TIMEOUT_MS,
+    maxRetries: (options?.maxRetries as number) ?? 2,
+    baseRetryDelayMs: (options?.baseRetryDelayMs as number) ?? 1000,
+    enableProgress: (options?.enableProgress as boolean) ?? true,
+    fastPathThresholdChars: (options?.fastPathThresholdChars as number) ?? 500,
+    defaultStrategy: (options?.defaultStrategy as typeof VALID_STRATEGIES[number]) ?? "auto",
+  }
+}
 
 // Performance: in-memory prompt cache
 const agentPromptCache = new Map<string, string>()
@@ -26,18 +49,19 @@ interface ProgressEvent {
 type ProgressCallback = (event: ProgressEvent) => void
 
 function emitProgress(context: OrchestratorContext, event: ProgressEvent): void {
-  if (context.onProgress) {
+  if (context.options?.enableProgress !== false && context.onProgress) {
     context.onProgress(event)
   }
-  // Also log for UI visibility
-  context.client.app.log({
-    body: {
-      service: "agent-factory",
-      level: "info",
-      message: `[Progress] ${event.phase}: ${event.step} (${event.progress}%) - ${event.message}`,
-      extra: { progress: event.progress, phase: event.phase, ...event.metadata },
-    },
-  })
+  if (context.options?.enableProgress !== false) {
+    context.client.app.log({
+      body: {
+        service: "agent-factory",
+        level: "info",
+        message: `[Progress] ${event.phase}: ${event.step} (${event.progress}%) - ${event.message}`,
+        extra: { progress: event.progress, phase: event.phase, ...event.metadata },
+      },
+    })
+  }
 }
 
 class OrchestrationError extends Error {
@@ -141,6 +165,7 @@ interface OrchestratorContext {
   abort: AbortSignal
   createdSessions: string[]
   onProgress?: ProgressCallback
+  options: AgentFactoryPluginOptions
 }
 
 function createTimeoutSignal(timeoutMs: number, externalSignal?: AbortSignal): AbortSignal {
@@ -162,11 +187,12 @@ function checkAbort(signal: AbortSignal, phase: string): void {
 }
 
 async function withRetry<T>(
+  context: OrchestratorContext,
   fn: () => Promise<T>,
-  phase: string,
-  maxRetries = 2,
-  baseDelayMs = 1000
+  phase: string
 ): Promise<T> {
+  const maxRetries = context.options.maxRetries
+  const baseDelayMs = context.options.baseRetryDelayMs
   let lastError: Error | undefined
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
@@ -174,7 +200,7 @@ async function withRetry<T>(
     } catch (error) {
       lastError = error instanceof Error ? error : new Error(String(error))
       if (attempt < maxRetries) {
-        const delay = baseDelayMs * Math.pow(2, attempt) + Math.random() * 500
+        const delay = context.options.baseRetryDelayMs * Math.pow(2, attempt) + Math.random() * 500
         await new Promise(resolve => setTimeout(resolve, delay))
       }
     }
@@ -241,7 +267,7 @@ function validateConsensusResult(result: any): result is ConsensusResult {
 
 async function createChildSession(context: OrchestratorContext, title: string, signal: AbortSignal) {
   checkAbort(signal, "createChildSession")
-  const response = await withRetry(async () => {
+  const response = await withRetry(context, async () => {
     return context.client.session.create({
       body: {
         parentID: context.project.id,
@@ -259,7 +285,7 @@ async function createChildSession(context: OrchestratorContext, title: string, s
 
 async function promptSession(context: OrchestratorContext, sessionId: string, systemPrompt: string, userPrompt: string, tools?: Record<string, boolean>, signal?: AbortSignal) {
   checkAbort(signal ?? context.abort, "promptSession")
-  const response = await withRetry(async () => {
+  const response = await withRetry(context, async () => {
     return context.client.session.prompt({
       path: { id: sessionId },
       body: {
@@ -611,7 +637,7 @@ export async function runOrchestration(context: OrchestratorContext, userPrompt:
 }> {
   validateInput(userPrompt, strategy)
   
-  const overallSignal = createTimeoutSignal(DEFAULT_OVERALL_TIMEOUT_MS, context.abort)
+  const overallSignal = createTimeoutSignal(context.options.overallTimeoutMs, context.abort)
   const startTime = Date.now()
 
   emitProgress(context, {
@@ -624,7 +650,7 @@ export async function runOrchestration(context: OrchestratorContext, userPrompt:
 
   try {
     // Performance: fast-path for single strategy or simple tasks
-    const isSimpleStrategy = strategy === "single" || (strategy === "auto" && userPrompt.length < 500)
+    const isSimpleStrategy = strategy === "single" || (strategy === "auto" && userPrompt.length < context.options.fastPathThresholdChars)
     
     if (isSimpleStrategy) {
       return runFastPath(context, userPrompt, overallSignal, startTime)
@@ -918,6 +944,7 @@ export function getOrchestrateTool(client: any, project: any, directory: string,
         worktree,
         abort: context.abort,
         createdSessions: [],
+        options: getOptions(),
       }
       
       try {
