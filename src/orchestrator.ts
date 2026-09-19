@@ -80,13 +80,15 @@ interface AgentSpec {
   retry_policy: { max_retries: number; simplify_on_retry: boolean }
 }
 
+interface AgentExecutionResult {
+  status: "completed" | "failed" | "timeout"
+  output: string
+  error: string | null
+  duration_ms: number
+}
+
 interface ExecutionResult {
-  results: Record<string, {
-    status: "completed" | "failed" | "timeout"
-    output: string
-    error: string | null
-    duration_ms: number
-  }>
+  results: Record<string, AgentExecutionResult>
   execution_metadata: {
     total_groups: number
     total_agents: number
@@ -297,6 +299,144 @@ ${agent.goal}
 OUTPUT FORMAT: ${agent.output_format}`
 }
 
+// Native DAG Execution: spawn agents in parallel groups via SDK
+async function runNativeDAGExecution(
+  context: OrchestratorContext, 
+  specs: AgentSpec[], 
+  userTask: string, 
+  signal: AbortSignal
+): Promise<ExecutionResult> {
+  const startTime = Date.now()
+  
+  // Build dependency graph
+  const agentMap = new Map(specs.map(s => [s.id, s]))
+  const groupMap = new Map<number, AgentSpec[]>()
+  
+  // Group by parallel_groups from analysis (we'll infer from depends_on)
+  const groups = new Map<number, AgentSpec[]>()
+  for (const spec of specs) {
+    const groupId = spec.depends_on.length === 0 ? 1 : Math.max(...spec.depends_on.map(d => {
+      const dep = agentMap.get(d)
+      return dep ? 1 : 1 // simplified: all independent = group 1, dependent = group 2+
+    })) + 1
+    
+    if (!groups.has(groupId)) groups.set(groupId, [])
+    groups.get(groupId)!.push(spec)
+  }
+  
+  const sortedGroups = Array.from(groups.entries()).sort((a, b) => a[0] - b[0])
+  const totalGroups = sortedGroups.length
+  let totalAgents = 0
+  let completed = 0
+  let failed = 0
+  const results: Record<string, AgentExecutionResult> = {}
+  const completedOutputs: Record<string, string> = {}
+
+  await context.client.app.log({
+    body: { service: "agent-factory", level: "info", message: `Starting native DAG execution: ${totalGroups} groups, ${specs.length} agents` }
+  })
+
+  for (const [groupId, groupAgents] of sortedGroups) {
+    checkAbort(signal, `dag-group-${groupId}`)
+    
+    await context.client.app.log({
+      body: { service: "agent-factory", level: "info", message: `Executing group ${groupId}/${totalGroups} (${groupAgents.length} agents)` }
+    })
+
+    // Spawn all agents in this group in parallel
+    const groupPromises = groupAgents.map(async (spec) => {
+      const agentStartTime = Date.now()
+      const sessionTitle = `agent:${spec.id}:${spec.role}`
+      
+      try {
+        checkAbort(signal, `agent-${spec.id}`)
+        
+        const session = await createChildSession(context, sessionTitle, signal)
+        
+        // Build prompt with dependency outputs
+        const depOutputs: Record<string, string> = {}
+        for (const depId of spec.depends_on) {
+          if (completedOutputs[depId]) {
+            depOutputs[depId] = completedOutputs[depId]
+          }
+        }
+        
+        const agentPrompt = buildAgentPrompt(spec, userTask, depOutputs)
+        
+        // Convert tools array to tools object for SDK
+        const toolsObj: Record<string, boolean> = {}
+        for (const tool of spec.tools) {
+          toolsObj[tool] = true
+        }
+        
+        const response = await promptSession(
+          context, 
+          session.id, 
+          spec.prompt, 
+          agentPrompt,
+          toolsObj,
+          signal
+        )
+        
+        const output = response.parts.find(p => p.type === "text")?.text ?? ""
+        const durationMs = Date.now() - agentStartTime
+        
+        completedOutputs[spec.id] = output
+        completed++
+        
+        return {
+          id: spec.id,
+          result: {
+            status: "completed" as const,
+            output,
+            error: null,
+            duration_ms: durationMs,
+          }
+        }
+      } catch (error) {
+        const durationMs = Date.now() - agentStartTime
+        failed++
+        
+        return {
+          id: spec.id,
+          result: {
+            status: "failed" as const,
+            output: "",
+            error: error instanceof Error ? error.message : String(error),
+            duration_ms: durationMs,
+          }
+        }
+      }
+    })
+
+    // Wait for all agents in this group to complete
+    const groupResults = await Promise.all(groupPromises)
+    
+    for (const { id, result } of groupResults) {
+      results[id] = result
+    }
+    
+    totalAgents += groupAgents.length
+    
+    await context.client.app.log({
+      body: { service: "agent-factory", level: "info", message: `Group ${groupId} complete: ${groupAgents.length} agents` }
+    })
+  }
+
+  const totalTime = Date.now() - startTime
+
+  return {
+    results,
+    execution_metadata: {
+      total_groups: totalGroups,
+      total_agents: totalAgents,
+      completed,
+      failed,
+      total_time_ms: totalTime,
+    }
+  }
+}
+
 async function runPhase1Analyze(context: OrchestratorContext, userPrompt: string, strategyOverride: string, signal: AbortSignal): Promise<TaskAnalysis> {
   const child = await createChildSession(context, "agent-factory:analyze", signal)
   const factoryPrompt = getAgentPrompt("agent-factory")
@@ -359,20 +499,9 @@ You are in Phase 2: PLAN. Generate agent specifications from the analysis. Outpu
   return { analysis, specs }
 }
 
+// REPLACED: Native DAG execution instead of LLM-based execution-engine
 async function runPhase3Execute(context: OrchestratorContext, specs: AgentSpec[], userTask: string, signal: AbortSignal): Promise<ExecutionResult> {
-  const child = await createChildSession(context, "execution-engine:execute", signal)
-  const executionPrompt = getAgentPrompt("execution-engine")
-  const systemPrompt = `${executionPrompt}
-
-You are in Phase 3: EXECUTE. Execute the agent DAG. Output ONLY the ExecutionResult JSON.`
-
-  // Performance: send reduced spec (no full prompts)
-  const reducedSpecs = specs.map(buildExecutionSpec)
-  
-  const response = await promptSession(context, child.id, systemPrompt, `Agent specs:\n${JSON.stringify(reducedSpecs, null, 2)}\n\nUser task: ${userTask}`, undefined, signal)
-  const result = extractJson<ExecutionResult>(response.parts.find(p => p.type === "text")?.text ?? "")
-  if (!result || !validateExecutionResult(result)) throw new OrchestrationError("Failed to parse or validate execution result", "phase3-execute")
-  return result
+  return runNativeDAGExecution(context, specs, userTask, signal)
 }
 
 async function runPhase4Consensus(context: OrchestratorContext, executionResult: ExecutionResult, strategy: string, signal: AbortSignal): Promise<ConsensusResult> {
@@ -463,7 +592,7 @@ You are handling a SIMPLE task. Analyze and directly produce the final agent spe
 
     const execution = await runPhase3Execute(context, specs, userPrompt, overallSignal)
     phasesCompleted++
-    await context.client.app.log({ body: { service: "agent-factory", level: "info", message: "Phase 3: Execute complete" } })
+    await context.client.app.log({ body: { service: "agent-factory", level: "info", message: "Phase 3: Native DAG execution complete" } })
 
     const finalStrategy = strategy !== "auto" ? strategy : analysis.consensus_strategy
     
