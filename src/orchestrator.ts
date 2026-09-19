@@ -15,6 +15,31 @@ const VALID_STRATEGIES = ["auto", "single", "debate", "voting", "expert_review",
 // Performance: in-memory prompt cache
 const agentPromptCache = new Map<string, string>()
 
+interface ProgressEvent {
+  phase: string
+  step: string
+  progress: number // 0-100
+  message: string
+  metadata?: Record<string, unknown>
+}
+
+type ProgressCallback = (event: ProgressEvent) => void
+
+function emitProgress(context: OrchestratorContext, event: ProgressEvent): void {
+  if (context.onProgress) {
+    context.onProgress(event)
+  }
+  // Also log for UI visibility
+  context.client.app.log({
+    body: {
+      service: "agent-factory",
+      level: "info",
+      message: `[Progress] ${event.phase}: ${event.step} (${event.progress}%) - ${event.message}`,
+      extra: { progress: event.progress, phase: event.phase, ...event.metadata },
+    },
+  })
+}
+
 class OrchestrationError extends Error {
   constructor(
     message: string,
@@ -115,6 +140,7 @@ interface OrchestratorContext {
   worktree: PluginInput["worktree"]
   abort: AbortSignal
   createdSessions: string[]
+  onProgress?: ProgressCallback
 }
 
 function createTimeoutSignal(timeoutMs: number, externalSignal?: AbortSignal): AbortSignal {
@@ -310,14 +336,11 @@ async function runNativeDAGExecution(
   
   // Build dependency graph
   const agentMap = new Map(specs.map(s => [s.id, s]))
-  const groupMap = new Map<number, AgentSpec[]>()
-  
-  // Group by parallel_groups from analysis (we'll infer from depends_on)
   const groups = new Map<number, AgentSpec[]>()
   for (const spec of specs) {
     const groupId = spec.depends_on.length === 0 ? 1 : Math.max(...spec.depends_on.map(d => {
       const dep = agentMap.get(d)
-      return dep ? 1 : 1 // simplified: all independent = group 1, dependent = group 2+
+      return dep ? 1 : 1
     })) + 1
     
     if (!groups.has(groupId)) groups.set(groupId, [])
@@ -332,28 +355,47 @@ async function runNativeDAGExecution(
   const results: Record<string, AgentExecutionResult> = {}
   const completedOutputs: Record<string, string> = {}
 
-  await context.client.app.log({
-    body: { service: "agent-factory", level: "info", message: `Starting native DAG execution: ${totalGroups} groups, ${specs.length} agents` }
+  emitProgress(context, {
+    phase: "execution",
+    step: "starting",
+    progress: 0,
+    message: `Starting native DAG execution: ${totalGroups} groups, ${specs.length} agents`,
+    metadata: { totalGroups, totalAgents: specs.length }
   })
 
-  for (const [groupId, groupAgents] of sortedGroups) {
+  for (let groupIndex = 0; groupIndex < sortedGroups.length; groupIndex++) {
+    const [groupId, groupAgents] = sortedGroups[groupIndex]
     checkAbort(signal, `dag-group-${groupId}`)
     
-    await context.client.app.log({
-      body: { service: "agent-factory", level: "info", message: `Executing group ${groupId}/${totalGroups} (${groupAgents.length} agents)` }
+    const groupProgressBase = Math.round((groupIndex / totalGroups) * 100)
+    const groupProgressStep = Math.round(100 / totalGroups)
+    
+    emitProgress(context, {
+      phase: "execution",
+      step: `group-${groupId}-start`,
+      progress: groupProgressBase,
+      message: `Executing group ${groupId}/${totalGroups} (${groupAgents.length} agents)`,
+      metadata: { groupId, groupIndex, totalGroups, agentsInGroup: groupAgents.length }
     })
 
     // Spawn all agents in this group in parallel
-    const groupPromises = groupAgents.map(async (spec) => {
+    const groupPromises = groupAgents.map(async (spec, agentIndex) => {
       const agentStartTime = Date.now()
       const sessionTitle = `agent:${spec.id}:${spec.role}`
       
       try {
         checkAbort(signal, `agent-${spec.id}`)
         
-        const session = await createChildSession(context, sessionTitle, signal)
+        emitProgress(context, {
+          phase: "execution",
+          step: `agent-${spec.id}-start`,
+          progress: groupProgressBase + Math.round((agentIndex / groupAgents.length) * groupProgressStep),
+          message: `Starting agent ${spec.id} (${spec.role})`,
+          metadata: { agentId: spec.id, role: spec.role, groupId }
+        })
         
-        // Build prompt with dependency outputs
+        const session = await createChildSession(context, `agent:${spec.id}:${spec.role}`, signal)
+        
         const depOutputs: Record<string, string> = {}
         for (const depId of spec.depends_on) {
           if (completedOutputs[depId]) {
@@ -363,7 +405,6 @@ async function runNativeDAGExecution(
         
         const agentPrompt = buildAgentPrompt(spec, userTask, depOutputs)
         
-        // Convert tools array to tools object for SDK
         const toolsObj: Record<string, boolean> = {}
         for (const tool of spec.tools) {
           toolsObj[tool] = true
@@ -384,6 +425,14 @@ async function runNativeDAGExecution(
         completedOutputs[spec.id] = output
         completed++
         
+        emitProgress(context, {
+          phase: "execution",
+          step: `agent-${spec.id}-complete`,
+          progress: groupProgressBase + Math.round(((agentIndex + 1) / groupAgents.length) * groupProgressStep),
+          message: `Agent ${spec.id} completed (${durationMs}ms)`,
+          metadata: { agentId: spec.id, durationMs, status: "completed" }
+        })
+        
         return {
           id: spec.id,
           result: {
@@ -391,11 +440,19 @@ async function runNativeDAGExecution(
             output,
             error: null,
             duration_ms: durationMs,
-          }
-        }
-      } catch (error) {
+}
+    }
+  } catch (error) {
         const durationMs = Date.now() - agentStartTime
         failed++
+        
+        emitProgress(context, {
+          phase: "execution",
+          step: `agent-${spec.id}-failed`,
+          progress: groupProgressBase + Math.round(((agentIndex + 1) / groupAgents.length) * groupProgressStep),
+          message: `Agent ${spec.id} failed: ${error instanceof Error ? error.message : String(error)}`,
+          metadata: { agentId: spec.id, durationMs, status: "failed", error: error instanceof Error ? error.message : String(error) }
+        })
         
         return {
           id: spec.id,
@@ -418,12 +475,24 @@ async function runNativeDAGExecution(
     
     totalAgents += groupAgents.length
     
-    await context.client.app.log({
-      body: { service: "agent-factory", level: "info", message: `Group ${groupId} complete: ${groupAgents.length} agents` }
+    emitProgress(context, {
+      phase: "execution",
+      step: `group-${groupId}-complete`,
+      progress: Math.round(((groupIndex + 1) / totalGroups) * 100),
+      message: `Group ${groupId} complete: ${groupAgents.length} agents`,
+      metadata: { groupId, agentsCompleted: groupAgents.length }
     })
   }
 
   const totalTime = Date.now() - startTime
+
+  emitProgress(context, {
+    phase: "execution",
+    step: "complete",
+    progress: 100,
+    message: `Native DAG execution complete: ${completed}/${totalAgents} agents succeeded`,
+    metadata: { totalGroups, totalAgents, completed, failed, totalTimeMs: totalTime }
+  })
 
   return {
     results,
@@ -544,98 +613,288 @@ export async function runOrchestration(context: OrchestratorContext, userPrompt:
   
   const overallSignal = createTimeoutSignal(DEFAULT_OVERALL_TIMEOUT_MS, context.abort)
   const startTime = Date.now()
-  let phasesCompleted = 0
 
-  await context.client.app.log({
-    body: { service: "agent-factory", level: "info", message: "Starting orchestration pipeline" }
+  emitProgress(context, {
+    phase: "init",
+    step: "starting",
+    progress: 0,
+    message: "Starting orchestration pipeline",
+    metadata: { totalPhases: 5 }
   })
 
   try {
     // Performance: fast-path for single strategy or simple tasks
     const isSimpleStrategy = strategy === "single" || (strategy === "auto" && userPrompt.length < 500)
     
-    let analysis: TaskAnalysis
-    let specs: AgentSpec[]
-    
     if (isSimpleStrategy) {
-      // Fast path: single phase for simple tasks
-      const child = await createChildSession(context, "agent-factory:fast-path", overallSignal)
-      const factoryPrompt = getAgentPrompt("agent-factory")
-      const systemPrompt = `${factoryPrompt}
+      return runFastPath(context, userPrompt, overallSignal, startTime)
+    } else {
+      return runComplexPath(context, userPrompt, strategy, overallSignal, startTime)
+    }
+  } catch (error) {
+    await cleanupSessions(context)
+    throw error
+  }
+}
+
+async function runFastPath(
+  context: OrchestratorContext, 
+  userPrompt: string, 
+  signal: AbortSignal,
+  startTime: number
+) {
+  emitProgress(context, {
+    phase: "fast-path",
+    step: "starting",
+    progress: 10,
+    message: "Running fast-path for simple task",
+    metadata: { strategy: "single" }
+  })
+  
+  const child = await createChildSession(context, "agent-factory:fast-path", signal)
+  const factoryPrompt = getAgentPrompt("agent-factory")
+  const systemPrompt = `${factoryPrompt}
 
 You are handling a SIMPLE task. Analyze and directly produce the final agent specification in one step. Output ONLY the AgentSpec[] JSON.`
-      
-      const response = await promptSession(context, child.id, systemPrompt, `Task: ${userPrompt}\n\nStrategy: single`, undefined, overallSignal)
-      const fastPathSpecs = extractJson<AgentSpec[]>(response.parts.find(p => p.type === "text")?.text ?? "")
-      if (!fastPathSpecs || !validateAgentSpecs(fastPathSpecs)) throw new OrchestrationError("Failed to parse or validate agent specs", "fast-path")
-      
-      // Create minimal analysis for metadata
-      analysis = {
-        task_type: "coding",
-        complexity: "simple",
-        domains: ["general"],
-        capabilities: ["code_execution"],
-        consensus_strategy: "single",
-        parallel_groups: [{ group_id: 1, independent: true, subtasks: fastPathSpecs.map(s => s.goal) }]
+  
+  const response = await promptSession(context, child.id, systemPrompt, `Task: ${userPrompt}\n\nStrategy: single`, undefined, signal)
+  const fastPathSpecs = extractJson<AgentSpec[]>(response.parts.find(p => p.type === "text")?.text ?? "")
+  if (!fastPathSpecs || !validateAgentSpecs(fastPathSpecs)) throw new OrchestrationError("Failed to parse or validate agent specs", "fast-path")
+  
+  const analysis: TaskAnalysis = {
+    task_type: "coding",
+    complexity: "simple",
+    domains: ["general"],
+    capabilities: ["code_execution"],
+    consensus_strategy: "single",
+    parallel_groups: [{ group_id: 1, independent: true, subtasks: fastPathSpecs.map(s => s.goal) }]
+  }
+  const specs = fastPathSpecs
+  
+  emitProgress(context, {
+    phase: "fast-path",
+    step: "complete",
+    progress: 20,
+    message: "Fast-path complete",
+    metadata: { agentsGenerated: specs.length }
+  })
+
+  // Fast-path: create minimal execution result and synthesize
+  const execution: ExecutionResult = {
+    results: {
+      "fast-path": {
+        status: "completed",
+        output: "Fast-path completed directly",
+        error: null,
+        duration_ms: 0,
       }
-      specs = fastPathSpecs
-      phasesCompleted = 1
-      await context.client.app.log({ body: { service: "agent-factory", level: "info", message: "Fast-path: single strategy complete" } })
-    } else {
-      // Performance: run phase 1 & 2 in parallel
-      const { analysis: a, specs: s } = await runPhase1And2Parallel(context, userPrompt, strategy, overallSignal)
-      analysis = a
-      specs = s
-      phasesCompleted = 2
-      await context.client.app.log({ body: { service: "agent-factory", level: "info", message: "Phase 1+2: Analyze & Plan complete (parallel)" } })
+    },
+    execution_metadata: {
+      total_groups: 1,
+      total_agents: specs.length,
+      completed: specs.length,
+      failed: 0,
+      total_time_ms: 0,
     }
+  }
 
-    const execution = await runPhase3Execute(context, specs, userPrompt, overallSignal)
-    phasesCompleted++
-    await context.client.app.log({ body: { service: "agent-factory", level: "info", message: "Phase 3: Native DAG execution complete" } })
+  const consensus: ConsensusResult = {
+    consensus_reached: true,
+    final_output: "Fast-path completed",
+    confidence: 0.9,
+    strategy_used: "single",
+    rounds_executed: 1,
+    agent_contributions: {},
+    metadata: { convergence_score: 1.0 }
+  }
 
-    const finalStrategy = strategy !== "auto" ? strategy : analysis.consensus_strategy
+  const finalResult = await runPhase5Synthesize(context, consensus, execution, signal)
+  
+  const totalTime = Date.now() - startTime
+
+  emitProgress(context, {
+    phase: "complete",
+    step: "done",
+    progress: 100,
+    message: `Fast-path complete in ${totalTime}ms`,
+    metadata: { totalTimeMs: totalTime }
+  })
+
+  await cleanupSessions(context)
+  return {
+    result: finalResult,
+    metadata: {
+      phases_completed: 1,
+      agents_spawned: specs.length,
+      parallel_groups: 1,
+      consensus_strategy: "single",
+      consensus_reached: true,
+      confidence: 0.9,
+      total_time_ms: totalTime,
+    }
+  }
+}
+
+async function runComplexPath(
+  context: OrchestratorContext, 
+  userPrompt: string, 
+  strategy: string,
+  signal: AbortSignal,
+  startTime: number
+) {
+  let phasesCompleted = 0
+  let analysis: TaskAnalysis
+  let specs: AgentSpec[]
+  
+  // Phase 1: Analyze
+  emitProgress(context, {
+    phase: "analyze",
+    step: "starting",
+    progress: 10,
+    message: "Analyzing task complexity and domains",
+    metadata: { strategy }
+  })
+  
+  const child1 = await createChildSession(context, "agent-factory:analyze", signal)
+  const factoryPrompt = getAgentPrompt("agent-factory")
+  const systemPrompt = `${factoryPrompt}
+
+You are in Phase 1: ANALYZE. Analyze the task and output ONLY the TaskAnalysis JSON.`
+
+  const analysisResponse = await promptSession(context, child1.id, systemPrompt, `Task: ${userPrompt}\n\n${strategy !== "auto" ? `Strategy override: ${strategy}` : "Select the best strategy automatically."}`, undefined, signal)
+  const parsedAnalysis = extractJson<TaskAnalysis>(analysisResponse.parts.find(p => p.type === "text")?.text ?? "")
+  if (!parsedAnalysis || !validateTaskAnalysis(parsedAnalysis)) throw new OrchestrationError("Failed to parse or validate task analysis", "phase1-analyze")
+  analysis = parsedAnalysis
+  
+  emitProgress(context, {
+    phase: "analyze",
+    step: "complete",
+    progress: 20,
+    message: `Task analyzed: ${analysis.task_type}/${analysis.complexity}`,
+    metadata: { taskType: analysis.task_type, complexity: analysis.complexity, domains: analysis.domains }
+  })
+
+  // Phase 2: Plan
+  emitProgress(context, {
+    phase: "plan",
+    step: "starting",
+    progress: 25,
+    message: "Generating agent specifications",
+    metadata: { expectedAgents: "unknown" }
+  })
+  
+  const child2 = await createChildSession(context, "agent-factory:plan", signal)
+  const planSystemPrompt = `${factoryPrompt}
+
+You are in Phase 2: PLAN. Generate agent specifications from the analysis. Output ONLY the JSON array.`
+
+  const planResponse = await promptSession(context, child2.id, planSystemPrompt, JSON.stringify(analysis, null, 2), undefined, signal)
+  const parsedSpecs = extractJson<AgentSpec[]>(planResponse.parts.find(p => p.type === "text")?.text ?? "")
+  if (!parsedSpecs || !validateAgentSpecs(parsedSpecs)) throw new OrchestrationError("Failed to parse or validate agent specs", "phase2-plan")
+  specs = parsedSpecs
+  
+  emitProgress(context, {
+    phase: "plan",
+    step: "complete",
+    progress: 35,
+    message: `Generated ${specs.length} agent specifications`,
+    metadata: { agentCount: specs.length, roles: specs.map(s => s.role) }
+  })
+
+  // Phase 3: Execute (Native DAG)
+  emitProgress(context, {
+    phase: "execute",
+    step: "starting",
+    progress: 40,
+    message: "Executing agent DAG natively",
+    metadata: { agentCount: specs.length }
+  })
+  
+  const execution = await runPhase3Execute(context, specs, userPrompt, signal)
+  
+  emitProgress(context, {
+    phase: "execute",
+    step: "complete",
+    progress: 70,
+    message: `Execution complete: ${execution.execution_metadata.completed}/${execution.execution_metadata.total_agents} agents succeeded`,
+    metadata: { completed: execution.execution_metadata.completed, total: execution.execution_metadata.total_agents }
+  })
+
+  const finalStrategy = strategy !== "auto" ? strategy : analysis.consensus_strategy
+  
+  // Phase 4: Consensus
+  let consensus: ConsensusResult
+  if (finalStrategy === "single") {
+    emitProgress(context, {
+      phase: "consensus",
+      step: "skipped",
+      progress: 75,
+      message: "Consensus skipped (single strategy)",
+      metadata: { strategy: "single" }
+    })
     
-    // Skip consensus for single strategy
-    let consensus: ConsensusResult
-    if (finalStrategy === "single") {
-      consensus = {
-        consensus_reached: true,
-        final_output: execution.results[Object.keys(execution.results)[0]]?.output ?? "No output",
-        confidence: 0.9,
-        strategy_used: "single",
-        rounds_executed: 1,
-        agent_contributions: {},
-        metadata: { convergence_score: 1.0 }
-      }
-      phasesCompleted++
-      await context.client.app.log({ body: { service: "agent-factory", level: "info", message: "Phase 4: Consensus skipped (single strategy)" } })
-    } else {
-      consensus = await runPhase4Consensus(context, execution, finalStrategy, overallSignal)
-      phasesCompleted++
-      await context.client.app.log({ body: { service: "agent-factory", level: "info", message: "Phase 4: Consensus complete" } })
+    consensus = {
+      consensus_reached: true,
+      final_output: execution.results[Object.keys(execution.results)[0]]?.output ?? "No output",
+      confidence: 0.9,
+      strategy_used: "single",
+      rounds_executed: 1,
+      agent_contributions: {},
+      metadata: { convergence_score: 1.0 }
     }
+  } else {
+    emitProgress(context, {
+      phase: "consensus",
+      step: "starting",
+      progress: 75,
+      message: `Running ${finalStrategy} consensus`,
+      metadata: { strategy: finalStrategy }
+    })
+    
+    consensus = await runPhase4Consensus(context, execution, finalStrategy, signal)
+    
+    emitProgress(context, {
+      phase: "consensus",
+      step: "complete",
+      progress: 85,
+      message: `Consensus ${consensus.consensus_reached ? "reached" : "failed"} (confidence: ${Math.round(consensus.confidence * 100)}%)`,
+      metadata: { consensusReached: consensus.consensus_reached, confidence: consensus.confidence }
+    })
+  }
 
-    const finalResult = await runPhase5Synthesize(context, consensus, execution, overallSignal)
-    phasesCompleted++
-    await context.client.app.log({ body: { service: "agent-factory", level: "info", message: "Phase 5: Synthesize complete" } })
+  // Phase 5: Synthesize
+  emitProgress(context, {
+    phase: "synthesize",
+    step: "starting",
+    progress: 90,
+    message: "Synthesizing final result",
+    metadata: {}
+  })
+  
+  const finalResult = await runPhase5Synthesize(context, consensus, execution, signal)
+  
+  const totalTime = Date.now() - startTime
 
-    const totalTime = Date.now() - startTime
+  emitProgress(context, {
+    phase: "complete",
+    step: "done",
+    progress: 100,
+    message: `Orchestration complete in ${totalTime}ms`,
+    metadata: { totalTimeMs: totalTime }
+  })
 
-    return {
-      result: finalResult,
-      metadata: {
-        phases_completed: phasesCompleted,
-        agents_spawned: execution.execution_metadata.total_agents,
-        parallel_groups: execution.execution_metadata.total_groups,
-        consensus_strategy: finalStrategy,
-        consensus_reached: consensus.consensus_reached,
-        confidence: consensus.confidence,
-        total_time_ms: totalTime,
-      }
+  await cleanupSessions(context)
+  return {
+    result: finalResult,
+    metadata: {
+      phases_completed: 5,
+      agents_spawned: execution.execution_metadata.total_agents,
+      parallel_groups: execution.execution_metadata.total_groups,
+      consensus_strategy: finalStrategy,
+      consensus_reached: consensus.consensus_reached,
+      confidence: consensus.confidence,
+      total_time_ms: totalTime,
     }
-  } finally {
-    await cleanupSessions(context)
   }
 }
 
