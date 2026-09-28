@@ -5,6 +5,7 @@ import {
   getTelemetrySnapshot,
   resetTelemetry,
   createTimeoutSignal,
+  validateAgentSpecs,
   OrchestrationError,
 } from "./orchestrator"
 import { createMockClient, makeContext, makeSpec, pipelineResponder, delay } from "./mock-client"
@@ -73,12 +74,63 @@ describe("runOrchestration: pipeline selection", () => {
 
     const result = await runOrchestration(context, LONG_PROMPT, "single")
 
-    expect(result.metadata.phases_completed).toBe(1)
+    expect(result.metadata.phases_completed).toBe(3)
     expect(result.metadata.consensus_strategy).toBe("single")
     expect(result.result).toBe("FINAL SYNTHESIZED RESULT")
     expect(mock.state.prompts.some(p => p.system.includes("Phase 1: ANALYZE"))).toBe(false)
     expect(mock.state.prompts.some(p => p.system.includes("SIMPLE task"))).toBe(true)
     expect(result.diagram.phaseTimings).toHaveProperty("fast-path")
+  })
+
+  test("repairs near-miss specs from the model instead of failing the run", async () => {
+    const messySpecs = {
+      agents: [{
+        role: "Implementer",
+        goal: "Write fibonacci.py",
+        prompt: "Write the fibonacci function",
+        model_tier: "high",
+        output_format: "plain text",
+      }],
+    }
+    const phaseFallback = pipelineResponder({ specs: specs() })
+    const mock = createMockClient({
+      respond: prompt =>
+        prompt.system.includes("SIMPLE task")
+          ? JSON.stringify(messySpecs)
+          : phaseFallback(prompt),
+    })
+    const context = makeContext(mock.client)
+
+    const result = await runOrchestration(context, SHORT_PROMPT, "auto")
+
+    expect(result.metadata.phases_completed).toBe(3)
+    expect(result.result).toBe("FINAL SYNTHESIZED RESULT")
+    expect(result.diagram.specs).toHaveLength(1)
+    expect(result.diagram.specs[0].model_tier).toBe("powerful")
+    expect(validateAgentSpecs(result.diagram.specs)).toBe(true)
+  })
+
+  test("retries spec generation when the model answers with prose instead of JSON", async () => {
+    let specCalls = 0
+    const phaseFallback = pipelineResponder({ specs: [makeSpec({ id: "a" })] })
+    const mock = createMockClient({
+      respond: prompt => {
+        if (prompt.system.includes("SIMPLE task")) {
+          specCalls++
+          return specCalls === 1
+            ? "Sure - I'll write that function for you now."
+            : JSON.stringify([makeSpec({ id: "a" })])
+        }
+        return phaseFallback(prompt)
+      },
+    })
+    const context = makeContext(mock.client)
+
+    const result = await runOrchestration(context, SHORT_PROMPT, "auto")
+
+    expect(specCalls).toBe(2)
+    expect(result.metadata.phases_completed).toBe(3)
+    expect(result.diagram.consensus!.final_output).toBe("OUTPUT[a]")
   })
 
   test("uses the fast path for a short auto prompt under the default threshold", async () => {
@@ -87,8 +139,24 @@ describe("runOrchestration: pipeline selection", () => {
 
     const result = await runOrchestration(context, SHORT_PROMPT, "auto")
 
-    expect(result.metadata.phases_completed).toBe(1)
+    expect(result.metadata.phases_completed).toBe(3)
     expect(mock.state.prompts.some(p => p.system.includes("Phase 1: ANALYZE"))).toBe(false)
+  })
+
+  test("executes the generated agents on the fast path instead of faking the run", async () => {
+    const mock = createMockClient({ respond: pipelineResponder({ specs: specs() }) })
+    const context = makeContext(mock.client)
+
+    const result = await runOrchestration(context, SHORT_PROMPT, "auto")
+
+    const systems = mock.state.prompts.map(p => p.system)
+    expect(systems).toContain("SYSTEM_PROMPT_FOR_a")
+    expect(systems).toContain("SYSTEM_PROMPT_FOR_b")
+    expect(result.metadata.parallel_groups).toBe(2)
+    expect(result.diagram.execution!.execution_metadata.completed).toBe(2)
+    // single consensus adopts the primary agent's real output
+    expect(result.diagram.consensus!.final_output).toBe("OUTPUT[a]")
+    expect(result.result).toBe("FINAL SYNTHESIZED RESULT")
   })
 
   test("respects fastPathThresholdChars=0 so short prompts still take the slow path", async () => {
@@ -106,7 +174,7 @@ describe("runOrchestration: pipeline selection", () => {
 
     const result = await runOrchestration(context, LONG_PROMPT, "auto")
 
-    expect(result.metadata.phases_completed).toBe(1)
+    expect(result.metadata.phases_completed).toBe(3)
     expect(mock.state.prompts.some(p => p.system.includes("SIMPLE task"))).toBe(true)
   })
 })
@@ -185,7 +253,7 @@ describe("runOrchestration: failures, cleanup and telemetry", () => {
     const snapshot = getTelemetrySnapshot()
     expect(snapshot.fastPathUsage).toBe(1)
     expect(snapshot.complexPathUsage).toBe(0)
-    expect(Object.keys(snapshot.phaseTimings)).toEqual(["fast-path"])
+    expect(Object.keys(snapshot.phaseTimings)).toEqual(["fast-path", "execute", "synthesize"])
   })
 
   test("records a failed run", async () => {

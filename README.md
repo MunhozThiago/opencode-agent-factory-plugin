@@ -60,7 +60,9 @@ User Prompt
 Final Result + Execution Summary
 ```
 
-Tasks marked `single`, or auto-detected prompts shorter than `fastPathThresholdChars`, take a fast path that skips straight to agent generation and synthesis.
+Tasks marked `single`, or auto-detected prompts shorter than `fastPathThresholdChars`, take a fast path that skips analysis and consensus: agents are generated, run through the same DAG scheduler, and synthesized.
+
+Spec output that is close-but-not-quite (unknown model tier, wrapper objects instead of a bare array, prose instead of JSON) is repaired or retried rather than failing the whole run, so a single sloppy model response does not abort the orchestration.
 
 ### What Makes This Different From Built-in Sub-Agents
 

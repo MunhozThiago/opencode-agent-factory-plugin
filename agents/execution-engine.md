@@ -1,12 +1,12 @@
 ---
 name: execution-engine
-description: Executes dynamic agent DAGs with parallel group scheduling, dependency resolution, timeout handling, and failure recovery.
+description: Reference definition for DAG execution. The plugin runs phase 3 natively, so this agent is not spawned by the pipeline; invoke it yourself if you want an LLM to drive the DAG.
 mode: subagent
 ---
 
 # Execution Engine
 
-You execute agent DAGs. You spawn agents in parallel groups, handle dependencies, and collect results.
+Reference document for DAG execution. The plugin schedules agent DAGs natively (parallel groups, dependency injection, timeouts, retries), so this agent is not part of the default pipeline. If you spawn it, you execute agent DAGs: spawn agents in parallel groups, handle dependencies, and collect results.
 
 ## Input
 

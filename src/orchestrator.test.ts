@@ -4,6 +4,7 @@ import {
   extractJson,
   validateTaskAnalysis,
   validateAgentSpecs,
+  normalizeAgentSpecs,
   validateExecutionResult,
   validateConsensusResult,
   validateInput,
@@ -197,6 +198,89 @@ describe("validateAgentSpecs", () => {
     const spec: any = makeSpec({ id: "a" })
     delete spec.retry_policy
     expect(validateAgentSpecs([spec])).toBe(false)
+  })
+})
+
+describe("normalizeAgentSpecs", () => {
+  test("passes a valid spec through untouched", () => {
+    const { specs, issues } = normalizeAgentSpecs([makeSpec({ id: "a" })])
+    expect(issues).toEqual([])
+    expect(specs).toHaveLength(1)
+    expect(validateAgentSpecs(specs)).toBe(true)
+  })
+
+  test("repairs off-vocabulary values instead of failing the run", () => {
+    const { specs, issues } = normalizeAgentSpecs([{
+      id: "a",
+      role: "Builder",
+      goal: "Build it",
+      prompt: "Do the work",
+      tools: "read, write",
+      model_tier: "high",
+      output_format: "plain text",
+      depends_on: [],
+      timeout_ms: 5000,
+      retry_policy: { max_retries: 2, simplify_on_retry: true },
+    }])
+
+    expect(specs).toHaveLength(1)
+    // "high" is an accepted alias for powerful, so it needs no issue
+    expect(specs[0].model_tier).toBe("powerful")
+    expect(specs[0].output_format).toBe("markdown")
+    expect(specs[0].tools).toEqual(["read", "write"])
+    expect(validateAgentSpecs(specs)).toBe(true)
+    expect(issues).toHaveLength(1)
+    expect(issues[0]).toContain("output_format")
+  })
+
+  test("falls back to balanced for an unknown model tier", () => {
+    const { specs, issues } = normalizeAgentSpecs([{
+      id: "a",
+      role: "Builder",
+      goal: "Build it",
+      prompt: "Do the work",
+      model_tier: "ultra",
+    }])
+
+    expect(specs[0].model_tier).toBe("balanced")
+    expect(issues.join(" ")).toContain("model_tier")
+  })
+
+  test("unwraps object wrappers such as {agents: [...]}", () => {
+    const { specs } = normalizeAgentSpecs({ agents: [makeSpec({ id: "a" })] })
+    expect(specs.map(s => s.id)).toEqual(["a"])
+  })
+
+  test("fills defaults for omitted fields and derives an id from the role", () => {
+    const { specs } = normalizeAgentSpecs([{
+      role: "Code Reviewer",
+      goal: "Review the diff",
+      prompt: "Review it",
+    }])
+
+    expect(specs).toHaveLength(1)
+    expect(specs[0].id).toBe("code-reviewer")
+    expect(specs[0].model_tier).toBe("balanced")
+    expect(specs[0].output_format).toBe("markdown")
+    expect(specs[0].timeout_ms).toBeGreaterThan(0)
+    expect(specs[0].retry_policy.max_retries).toBeGreaterThanOrEqual(0)
+    expect(validateAgentSpecs(specs)).toBe(true)
+  })
+
+  test("drops entries without a prompt and reports why", () => {
+    const { specs, issues } = normalizeAgentSpecs([
+      makeSpec({ id: "a" }),
+      { id: "broken", role: "Ghost", goal: "No prompt here" },
+    ])
+
+    expect(specs.map(s => s.id)).toEqual(["a"])
+    expect(issues.join(" ")).toContain("missing goal or prompt")
+  })
+
+  test("reports non-spec responses instead of throwing", () => {
+    expect(normalizeAgentSpecs("just text").specs).toEqual([])
+    expect(normalizeAgentSpecs(null).issues.length).toBeGreaterThan(0)
+    expect(normalizeAgentSpecs({ unrelated: true }).specs).toEqual([])
   })
 })
 

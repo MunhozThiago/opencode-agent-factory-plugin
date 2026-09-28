@@ -735,6 +735,192 @@ function validateTaskAnalysis(analysis: any): analysis is TaskAnalysis {
   )
 }
 
+const MODEL_TIER_ALIASES: Record<string, AgentSpec["model_tier"]> = {
+  powerful: "powerful", high: "powerful", premium: "powerful",
+  balanced: "balanced", medium: "balanced", standard: "balanced",
+  fast: "fast", low: "fast", cheap: "fast", light: "fast",
+}
+
+const OUTPUT_FORMAT_ALIASES: Record<string, AgentSpec["output_format"]> = {
+  json: "json",
+  markdown: "markdown", md: "markdown",
+  code: "code",
+  structured_text: "structured_text", structured: "structured_text",
+  text: "markdown", plain: "markdown", prose: "markdown",
+}
+
+function specString(value: unknown): string {
+  return typeof value === "string" ? value.trim() : ""
+}
+
+function specStringList(value: unknown): string[] {
+  if (typeof value === "string") {
+    return value.split(/[\s,]+/).map(v => v.trim()).filter(Boolean)
+  }
+  if (Array.isArray(value)) {
+    return value
+      .filter((v): v is string => typeof v === "string" && v.trim().length > 0)
+      .map(v => v.trim())
+  }
+  return []
+}
+
+function unwrapSpecList(raw: unknown): unknown[] | null {
+  if (Array.isArray(raw)) return raw
+  if (raw && typeof raw === "object") {
+    const record = raw as Record<string, unknown>
+    for (const key of ["agents", "specs", "agent_specs", "items", "results", "data"]) {
+      if (Array.isArray(record[key])) return record[key] as unknown[]
+    }
+    if (record.prompt || record.system_prompt || record.goal) return [raw]
+  }
+  return null
+}
+
+// Coerce a model-generated spec list into AgentSpec[]. Near-miss values (wrong
+// vocabulary, missing retry policy, object wrappers) are repaired instead of
+// failing the whole orchestration; every repair is reported as an issue.
+function normalizeAgentSpecs(raw: unknown): { specs: AgentSpec[]; issues: string[] } {
+  const issues: string[] = []
+  const list = unwrapSpecList(raw)
+  if (!list) return { specs: [], issues: ["response was not an array of agent specs"] }
+
+  const specs: AgentSpec[] = []
+  const seenIds = new Set<string>()
+
+  list.forEach((entry, index) => {
+    const label = `spec[${index}]`
+    if (!entry || typeof entry !== "object") {
+      issues.push(`${label}: not an object`)
+      return
+    }
+
+    const source = entry as Record<string, unknown>
+    const role = specString(source.role) || `Agent ${index + 1}`
+    const goal = specString(source.goal)
+    const prompt = specString(source.prompt) || specString(source.system) || specString(source.system_prompt)
+    if (!goal || !prompt) {
+      issues.push(`${label}: missing goal or prompt`)
+      return
+    }
+
+    const rawTier = specString(source.model_tier).toLowerCase()
+    if (rawTier && !MODEL_TIER_ALIASES[rawTier]) {
+      issues.push(`${label}: unknown model_tier "${rawTier}", using "balanced"`)
+    }
+
+    const rawFormat = specString(source.output_format ?? source.output)
+      .toLowerCase()
+      .replace(/[\s-]+/g, "_")
+    if (rawFormat && !OUTPUT_FORMAT_ALIASES[rawFormat]) {
+      issues.push(`${label}: unknown output_format "${rawFormat}", using "markdown"`)
+    }
+
+    const timeoutRaw = source.timeout_ms ?? source.timeout
+    const timeoutMs = typeof timeoutRaw === "number" && Number.isFinite(timeoutRaw) && timeoutRaw > 0
+      ? timeoutRaw
+      : 120000
+
+    const retryRaw = source.retry_policy as unknown
+    const retrySource = (retryRaw && typeof retryRaw === "object" ? retryRaw : null) as Record<string, unknown> | null
+    const retryPolicy = typeof retryRaw === "number"
+      ? { max_retries: retryRaw, simplify_on_retry: true }
+      : retrySource && typeof retrySource.max_retries === "number"
+        ? { max_retries: retrySource.max_retries, simplify_on_retry: retrySource.simplify_on_retry !== false }
+        : { max_retries: 1, simplify_on_retry: true }
+
+    let id = specString(source.id)
+      || role.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "")
+      || `agent-${index + 1}`
+    if (seenIds.has(id)) {
+      id = `${id}-${index + 1}`
+      issues.push(`${label}: duplicate id, renamed to "${id}"`)
+    }
+    seenIds.add(id)
+
+    specs.push({
+      id,
+      role,
+      goal,
+      prompt,
+      tools: specStringList(source.tools),
+      model_tier: MODEL_TIER_ALIASES[rawTier] ?? "balanced",
+      depends_on: specStringList(source.depends_on ?? source.dependencies),
+      output_format: OUTPUT_FORMAT_ALIASES[rawFormat] ?? "markdown",
+      timeout_ms: timeoutMs,
+      retry_policy: retryPolicy,
+    })
+  })
+
+  return { specs, issues }
+}
+// Generates AgentSpec[] from a child session and repairs near-miss output.
+// The model sometimes answers with prose (or does the task itself) instead of
+// JSON, so a failed parse is retried with an explicit JSON-only reminder.
+async function generateAgentSpecs(
+  context: OrchestratorContext,
+  title: string,
+  phase: string,
+  systemPrompt: string,
+  userPrompt: string,
+  signal: AbortSignal,
+  progress: number
+): Promise<{ specs: AgentSpec[]; issues: string[] }> {
+  const maxAttempts = Math.max(context.options.maxRetries, 1) + 1
+  let lastError = new OrchestrationError("Agent spec generation did not run", phase, undefined, true)
+
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    checkAbort(signal, phase)
+    try {
+      const child = await createChildSession(context, title, signal)
+      const reminder = attempt > 0
+        ? "\n\nREMINDER: reply with ONLY the AgentSpec[] JSON array. Do not perform the task, write files, run commands, or explain - output raw JSON."
+        : ""
+      const response = await promptSession(context, child.id, systemPrompt, userPrompt + reminder, undefined, signal)
+      const text = String(response.parts.find((p: any) => p.type === "text")?.text ?? "")
+      const raw = extractJson<unknown>(text)
+      if (raw === null) {
+        throw new OrchestrationError(
+          `Failed to parse agent specs: no JSON found in the response (it began with "${text.slice(0, 120).replace(/\s+/g, " ")}")`,
+          phase,
+          undefined,
+          true
+        )
+      }
+      const { specs, issues } = normalizeAgentSpecs(raw)
+      if (specs.length === 0) {
+        throw new OrchestrationError(
+          `No usable agent specs in the response: ${issues.slice(0, 5).join("; ") || "empty spec list"}`,
+          phase,
+          undefined,
+          true
+        )
+      }
+      return { specs, issues }
+    } catch (error) {
+      lastError = error instanceof OrchestrationError
+        ? error
+        : new OrchestrationError(
+            error instanceof Error ? error.message : String(error),
+            phase,
+            error instanceof Error ? error : undefined,
+            true
+          )
+      if (signal.aborted || context.abort.aborted) throw lastError
+      if (attempt + 1 < maxAttempts) {
+        emitProgress(context, {
+          phase,
+          step: "spec-retry",
+          progress,
+          message: `Agent spec generation failed, retrying (attempt ${attempt + 2}/${maxAttempts})`,
+          metadata: { attempt: attempt + 2, maxAttempts }
+        })
+      }
+    }
+  }
+  throw lastError
+}
+
 function validateAgentSpecs(specs: any): specs is AgentSpec[] {
   return Boolean(Array.isArray(specs) && specs.every(s =>
     s && typeof s.id === "string" && typeof s.role === "string" && typeof s.goal === "string" &&
@@ -1247,6 +1433,28 @@ export async function runOrchestration(context: OrchestratorContext, userPrompt:
   }
 }
 
+// `single` consensus: the primary agent's output is adopted as the consensus
+// result, with every agent's contribution recorded for the diagram.
+function buildSingleConsensus(specs: AgentSpec[], execution: ExecutionResult): ConsensusResult {
+  const outputs = specs
+    .map(spec => execution.results[spec.id])
+    .filter(result => result.status === "completed" && result.output.length > 0)
+  const failed = execution.execution_metadata.failed
+
+  return {
+    consensus_reached: outputs.length > 0,
+    final_output: outputs[0]?.output
+      ?? `No agent produced output (${failed}/${execution.execution_metadata.total_agents} failed)`,
+    confidence: failed === 0 ? 0.9 : outputs.length > 0 ? 0.6 : 0.3,
+    strategy_used: "single",
+    rounds_executed: 1,
+    agent_contributions: Object.fromEntries(
+      specs.map(spec => [spec.id, { weight: 1, accepted: Boolean(execution.results[spec.id]?.output) }])
+    ),
+    metadata: { convergence_score: failed === 0 ? 1 : 0.5 },
+  }
+}
+
 async function runFastPath(
   context: OrchestratorContext, 
   userPrompt: string, 
@@ -1261,20 +1469,35 @@ async function runFastPath(
     metadata: { strategy: "single" }
   })
   
-  const { finalResult, analysis, specs, execution, consensus } = await withPhase(
+  const specStart = Date.now()
+  const { analysis, specs } = await withPhase(
     context,
     signal,
     "fast-path",
     async (phaseSignal) => {
-      const child = await createChildSession(context, "agent-factory:fast-path", phaseSignal)
       const factoryPrompt = getAgentPrompt("agent-factory", context.customTemplates)
       const systemPrompt = `${factoryPrompt}
+  
+You are handling a SIMPLE task. Do NOT perform the task yourself: no file writes, no shell commands, no code execution. Produce ONLY the AgentSpec[] JSON array describing the agents that should do it.`
 
-You are handling a SIMPLE task. Analyze and directly produce the final agent specification in one step. Output ONLY the AgentSpec[] JSON.`
-
-      const response = await promptSession(context, child.id, systemPrompt, `Task: ${userPrompt}\n\nStrategy: single`, undefined, phaseSignal)
-      const fastPathSpecs = extractJson<AgentSpec[]>(response.parts.find((p: any) => p.type === "text")?.text ?? "")
-      if (!fastPathSpecs || !validateAgentSpecs(fastPathSpecs)) throw new OrchestrationError("Failed to parse or validate agent specs", "fast-path")
+      const { specs: fastPathSpecs, issues } = await generateAgentSpecs(
+        context,
+        "agent-factory:fast-path",
+        "fast-path",
+        systemPrompt,
+        `Task: ${userPrompt}\n\nStrategy: single`,
+        phaseSignal,
+        15
+      )
+      if (issues.length > 0) {
+        emitProgress(context, {
+          phase: "fast-path",
+          step: "spec-repair",
+          progress: 15,
+          message: `Repaired ${issues.length} agent spec issue(s)`,
+          metadata: { issueCount: issues.length }
+        })
+      }
 
       const analysis: TaskAnalysis = {
         task_type: "coding",
@@ -1284,49 +1507,33 @@ You are handling a SIMPLE task. Analyze and directly produce the final agent spe
         consensus_strategy: "single",
         parallel_groups: [{ group_id: 1, independent: true, subtasks: fastPathSpecs.map(s => s.goal) }]
       }
-      const specs = fastPathSpecs
 
-      emitProgress(context, {
-        phase: "fast-path",
-        step: "complete",
-        progress: 20,
-        message: "Fast-path complete",
-        metadata: { agentsGenerated: specs.length }
-      })
-
-      // Fast-path: create minimal execution result and synthesize
-      const execution: ExecutionResult = {
-        results: {
-          "fast-path": {
-            status: "completed",
-            output: "Fast-path completed directly",
-            error: null,
-            duration_ms: 0,
-          }
-        },
-        execution_metadata: {
-          total_groups: 1,
-          total_agents: specs.length,
-          completed: specs.length,
-          failed: 0,
-          total_time_ms: 0,
-        }
-      }
-
-      const consensus: ConsensusResult = {
-        consensus_reached: true,
-        final_output: "Fast-path completed",
-        confidence: 0.9,
-        strategy_used: "single",
-        rounds_executed: 1,
-        agent_contributions: {},
-        metadata: { convergence_score: 1.0 }
-      }
-
-      const finalResult = await runPhase5Synthesize(context, consensus, execution, phaseSignal)
-      return { finalResult, analysis, specs, execution, consensus }
+      return { analysis, specs: fastPathSpecs }
     }
   )
+  const specMs = Date.now() - specStart
+
+  emitProgress(context, {
+    phase: "fast-path",
+    step: "complete",
+    progress: 20,
+    message: "Fast-path specs generated",
+    metadata: { agentsGenerated: specs.length }
+  })
+
+  // The generated agents still have to do the work: run them through the same
+  // DAG scheduler as the complex path, then adopt the primary output.
+  const execStart = Date.now()
+  const execution = await withPhase(context, signal, "execute", phaseSignal =>
+    runNativeDAGExecution(context, specs, userPrompt, phaseSignal))
+  const execMs = Date.now() - execStart
+
+  const consensus = buildSingleConsensus(specs, execution)
+
+  const synthStart = Date.now()
+  const finalResult = await withPhase(context, signal, "synthesize", phaseSignal =>
+    runPhase5Synthesize(context, consensus, execution, phaseSignal))
+  const synthMs = Date.now() - synthStart
   
   const totalTime = Date.now() - startTime
 
@@ -1342,12 +1549,12 @@ You are handling a SIMPLE task. Analyze and directly produce the final agent spe
   return {
     result: finalResult,
     metadata: {
-      phases_completed: 1,
+      phases_completed: 3,
       agents_spawned: specs.length,
-      parallel_groups: 1,
+      parallel_groups: execution.execution_metadata.total_groups,
       consensus_strategy: "single",
-      consensus_reached: true,
-      confidence: 0.9,
+      consensus_reached: consensus.consensus_reached,
+      confidence: consensus.confidence,
       total_time_ms: totalTime,
     },
     diagram: {
@@ -1356,7 +1563,7 @@ You are handling a SIMPLE task. Analyze and directly produce the final agent spe
       execution,
       consensus,
       strategyReasoning: `Fast-path selected: task complexity is simple, using single strategy for direct execution.`,
-      phaseTimings: { "fast-path": totalTime },
+      phaseTimings: { "fast-path": specMs, execute: execMs, synthesize: synthMs },
     }
   }
 }
@@ -1424,15 +1631,29 @@ ${strategy !== "auto" ? `- User override: ${strategy}` : "- Auto-selected based 
   })
   
   specs = await withPhase(context, signal, "plan", async (phaseSignal) => {
-    const child2 = await createChildSession(context, "agent-factory:plan", phaseSignal)
     const planSystemPrompt = `${factoryPrompt}
 
-You are in Phase 2: PLAN. Generate agent specifications from the analysis. Output ONLY the JSON array.`
+You are in Phase 2: PLAN. Generate agent specifications from the analysis. Do NOT perform any of the work yourself: no file writes, no shell commands. Output ONLY the JSON array.`
 
-    const planResponse = await promptSession(context, child2.id, planSystemPrompt, JSON.stringify(analysis, null, 2), undefined, phaseSignal)
-    const parsedSpecs = extractJson<AgentSpec[]>(planResponse.parts.find((p: any) => p.type === "text")?.text ?? "")
-    if (!parsedSpecs || !validateAgentSpecs(parsedSpecs)) throw new OrchestrationError("Failed to parse or validate agent specs", "phase2-plan")
-    return parsedSpecs
+    const { specs: plannedSpecs, issues } = await generateAgentSpecs(
+      context,
+      "agent-factory:plan",
+      "phase2-plan",
+      planSystemPrompt,
+      JSON.stringify(analysis, null, 2),
+      phaseSignal,
+      30
+    )
+    if (issues.length > 0) {
+      emitProgress(context, {
+        phase: "plan",
+        step: "spec-repair",
+        progress: 30,
+        message: `Repaired ${issues.length} agent spec issue(s)`,
+        metadata: { issueCount: issues.length }
+      })
+    }
+    return plannedSpecs
   })
   phaseTimings["plan"] = Date.now() - phase2Start
   
@@ -1848,6 +2069,7 @@ export {
   validateInput,
   validateTaskAnalysis,
   validateAgentSpecs,
+  normalizeAgentSpecs,
   validateExecutionResult,
   validateConsensusResult,
   extractJson,
