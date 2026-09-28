@@ -1,0 +1,337 @@
+import { expect, test, describe, beforeEach } from "bun:test"
+import {
+  runOrchestration,
+  getOrchestrateTool,
+  getTelemetrySnapshot,
+  resetTelemetry,
+  createTimeoutSignal,
+  OrchestrationError,
+} from "./orchestrator"
+import { createMockClient, makeContext, makeSpec, pipelineResponder, delay } from "./mock-client"
+
+const LONG_PROMPT = "Design and implement a REST API for a todo application with authentication. ".repeat(8).trim()
+const SHORT_PROMPT = "say hi"
+
+function analysis(strategy = "debate") {
+  return {
+    task_type: "coding",
+    complexity: "complex",
+    domains: ["backend"],
+    capabilities: ["code_execution"],
+    consensus_strategy: strategy,
+    parallel_groups: [{ group_id: 1, independent: true, subtasks: ["build"] }],
+  }
+}
+
+function specs() {
+  return [makeSpec({ id: "a" }), makeSpec({ id: "b", depends_on: ["a"] })]
+}
+
+beforeEach(() => resetTelemetry())
+
+describe("runOrchestration: pipeline selection", () => {
+  test("runs the full five-phase pipeline for a long auto prompt", async () => {
+    const mock = createMockClient({ respond: pipelineResponder({ analysis: analysis(), specs: specs() }) })
+    const context = makeContext(mock.client)
+
+    const result = await runOrchestration(context, LONG_PROMPT, "auto")
+
+    expect(result.result).toBe("FINAL SYNTHESIZED RESULT")
+    expect(result.metadata.phases_completed).toBe(5)
+    expect(result.metadata.agents_spawned).toBe(2)
+    expect(result.metadata.parallel_groups).toBe(2)
+    expect(result.metadata.consensus_strategy).toBe("debate")
+    expect(result.metadata.consensus_reached).toBe(true)
+
+    const systems = mock.state.prompts.map(p => p.system)
+    expect(systems.some(s => s.includes("Phase 1: ANALYZE"))).toBe(true)
+    expect(systems.some(s => s.includes("Phase 2: PLAN"))).toBe(true)
+    expect(systems.some(s => s.includes("Phase 4: CONSENSUS"))).toBe(true)
+    expect(systems.some(s => s.includes("Phase 5: SYNTHESIZE"))).toBe(true)
+    expect(systems).toContain("SYSTEM_PROMPT_FOR_a")
+    expect(systems).toContain("SYSTEM_PROMPT_FOR_b")
+
+    expect(result.diagram.analysis!.task_type).toBe("coding")
+    expect(result.diagram.specs).toHaveLength(2)
+    expect(result.diagram.consensus!.strategy_used).toBe("debate")
+  })
+
+  test("skips the consensus phase when the strategy is single", async () => {
+    const mock = createMockClient({ respond: pipelineResponder({ analysis: analysis("single"), specs: specs() }) })
+    const context = makeContext(mock.client)
+
+    const result = await runOrchestration(context, LONG_PROMPT, "auto")
+
+    expect(result.metadata.consensus_strategy).toBe("single")
+    expect(mock.state.prompts.some(p => p.system.includes("Phase 4: CONSENSUS"))).toBe(false)
+    expect(result.diagram.consensus!.final_output).toBe("OUTPUT[a]")
+  })
+
+  test("uses the fast path for strategy=single", async () => {
+    const mock = createMockClient({ respond: pipelineResponder({ specs: specs() }) })
+    const context = makeContext(mock.client)
+
+    const result = await runOrchestration(context, LONG_PROMPT, "single")
+
+    expect(result.metadata.phases_completed).toBe(1)
+    expect(result.metadata.consensus_strategy).toBe("single")
+    expect(result.result).toBe("FINAL SYNTHESIZED RESULT")
+    expect(mock.state.prompts.some(p => p.system.includes("Phase 1: ANALYZE"))).toBe(false)
+    expect(mock.state.prompts.some(p => p.system.includes("SIMPLE task"))).toBe(true)
+    expect(result.diagram.phaseTimings).toHaveProperty("fast-path")
+  })
+
+  test("uses the fast path for a short auto prompt under the default threshold", async () => {
+    const mock = createMockClient({ respond: pipelineResponder({ specs: specs() }) })
+    const context = makeContext(mock.client)
+
+    const result = await runOrchestration(context, SHORT_PROMPT, "auto")
+
+    expect(result.metadata.phases_completed).toBe(1)
+    expect(mock.state.prompts.some(p => p.system.includes("Phase 1: ANALYZE"))).toBe(false)
+  })
+
+  test("respects fastPathThresholdChars=0 so short prompts still take the slow path", async () => {
+    const mock = createMockClient({ respond: pipelineResponder({ analysis: analysis(), specs: specs() }) })
+    const context = makeContext(mock.client, { fastPathThresholdChars: 0 })
+
+    const result = await runOrchestration(context, SHORT_PROMPT, "auto")
+
+    expect(result.metadata.phases_completed).toBe(5)
+  })
+
+  test("resolves auto to the configured defaultStrategy", async () => {
+    const mock = createMockClient({ respond: pipelineResponder({ specs: specs() }) })
+    const context = makeContext(mock.client, { defaultStrategy: "single" })
+
+    const result = await runOrchestration(context, LONG_PROMPT, "auto")
+
+    expect(result.metadata.phases_completed).toBe(1)
+    expect(mock.state.prompts.some(p => p.system.includes("SIMPLE task"))).toBe(true)
+  })
+})
+
+describe("runOrchestration: input validation", () => {
+  test("rejects an empty prompt", async () => {
+    const context = makeContext(createMockClient().client)
+    await expect(runOrchestration(context, "", "auto")).rejects.toThrow("Prompt cannot be empty")
+  })
+
+  test("rejects an unknown strategy", async () => {
+    const context = makeContext(createMockClient().client)
+    await expect(runOrchestration(context, LONG_PROMPT, "banana")).rejects.toThrow("Invalid strategy")
+  })
+
+  test("rejects a prompt above the size limit", async () => {
+    const context = makeContext(createMockClient().client)
+    await expect(runOrchestration(context, "x".repeat(50001), "auto")).rejects.toThrow("exceeds maximum length")
+  })
+})
+
+describe("runOrchestration: failures, cleanup and telemetry", () => {
+  test("cleans up every session it created when a phase fails", async () => {
+    const mock = createMockClient({ respond: () => "not json at all" })
+    const context = makeContext(mock.client)
+
+    const error = await runOrchestration(context, LONG_PROMPT, "auto").catch(e => e)
+
+    expect(error).toBeInstanceOf(OrchestrationError)
+    expect(error.message).toContain("task analysis")
+    expect(mock.state.created.length).toBeGreaterThan(0)
+    expect(mock.state.deleted).toEqual(mock.state.created)
+    expect(mock.state.openSessions.size).toBe(0)
+  })
+
+  test("cleans up sessions when the run succeeds", async () => {
+    const mock = createMockClient({ respond: pipelineResponder({ analysis: analysis(), specs: specs() }) })
+    const context = makeContext(mock.client)
+
+    await runOrchestration(context, LONG_PROMPT, "auto")
+
+    expect(mock.state.deleted).toEqual(mock.state.created)
+    expect(mock.state.openSessions.size).toBe(0)
+  })
+
+  test("records a successful run with per-phase timings", async () => {
+    const mock = createMockClient({ respond: pipelineResponder({ analysis: analysis(), specs: specs() }) })
+    const context = makeContext(mock.client)
+
+    await runOrchestration(context, LONG_PROMPT, "auto")
+
+    const snapshot = getTelemetrySnapshot()
+    expect(snapshot.totalOrchestrations).toBe(1)
+    expect(snapshot.successfulOrchestrations).toBe(1)
+    expect(snapshot.failedOrchestrations).toBe(0)
+    expect(snapshot.complexPathUsage).toBe(1)
+    expect(snapshot.fastPathUsage).toBe(0)
+    expect(snapshot.strategyUsage.debate).toBe(1)
+    expect(snapshot.totalAgentsSpawned).toBe(2)
+    expect(snapshot.avgExecutionTimeMs).toBeGreaterThanOrEqual(0)
+    expect(snapshot.avgAgentsPerOrchestration).toBe(2)
+
+    for (const phase of ["analyze", "plan", "execute", "consensus", "synthesize"]) {
+      expect(Array.isArray(snapshot.phaseTimings[phase])).toBe(true)
+      expect(snapshot.phaseTimings[phase]!.length).toBe(1)
+      expect(snapshot.phaseTimings[phase]![0]).toBeGreaterThanOrEqual(0)
+    }
+  })
+
+  test("records fast-path usage", async () => {
+    const mock = createMockClient({ respond: pipelineResponder({ specs: specs() }) })
+    const context = makeContext(mock.client)
+
+    await runOrchestration(context, LONG_PROMPT, "single")
+
+    const snapshot = getTelemetrySnapshot()
+    expect(snapshot.fastPathUsage).toBe(1)
+    expect(snapshot.complexPathUsage).toBe(0)
+    expect(Object.keys(snapshot.phaseTimings)).toEqual(["fast-path"])
+  })
+
+  test("records a failed run", async () => {
+    const mock = createMockClient({ respond: () => "" })
+    const context = makeContext(mock.client)
+
+    await expect(runOrchestration(context, LONG_PROMPT, "auto")).rejects.toThrow()
+
+    const snapshot = getTelemetrySnapshot()
+    expect(snapshot.totalOrchestrations).toBe(1)
+    expect(snapshot.failedOrchestrations).toBe(1)
+    expect(snapshot.successfulOrchestrations).toBe(0)
+  })
+
+  test("resetTelemetry clears every counter", async () => {
+    const mock = createMockClient({ respond: pipelineResponder({ specs: specs() }) })
+    await runOrchestration(makeContext(mock.client), LONG_PROMPT, "single")
+
+    resetTelemetry()
+
+    const snapshot = getTelemetrySnapshot()
+    expect(snapshot.totalOrchestrations).toBe(0)
+    expect(snapshot.fastPathUsage).toBe(0)
+    expect(snapshot.phaseTimings).toEqual({})
+    expect(snapshot.strategyUsage).toEqual({})
+  })
+})
+
+describe("runOrchestration: child session contract", () => {
+  test("every phase prompt pins an agent and disables orchestrate", async () => {
+    const mock = createMockClient({ respond: pipelineResponder({ analysis: analysis(), specs: specs() }) })
+    const context = makeContext(mock.client)
+
+    await runOrchestration(context, LONG_PROMPT, "auto")
+
+    expect(mock.state.prompts.length).toBeGreaterThan(0)
+    for (const prompt of mock.state.prompts) {
+      expect(prompt.agent).toBe("build")
+      expect(prompt.tools?.orchestrate).toBe(false)
+      expect(prompt.tools?.delegate).toBe(false)
+    }
+  })
+
+  test("honours a configured child agent", async () => {
+    const mock = createMockClient({ respond: pipelineResponder({ analysis: analysis(), specs: specs() }) })
+    const context = makeContext(mock.client, { childAgent: "general" })
+
+    await runOrchestration(context, LONG_PROMPT, "auto")
+
+    expect(mock.state.prompts.every(p => p.agent === "general")).toBe(true)
+  })
+})
+
+describe("runOrchestration: timeouts and aborts", () => {
+  test("aborts the run when the overall timeout elapses", async () => {
+    const mock = createMockClient({ respond: pipelineResponder({ analysis: analysis(), specs: specs() }), createDelayMs: 30 })
+    const context = makeContext(mock.client, { overallTimeoutMs: 1 })
+
+    const error = await runOrchestration(context, LONG_PROMPT, "auto").catch(e => e)
+
+    expect(error).toBeInstanceOf(Error)
+    expect(error.message).toMatch(/abort/i)
+    expect(mock.state.deleted).toEqual(mock.state.created)
+  })
+
+  test("fails a phase that exceeds phaseTimeoutMs with a phase-scoped error", async () => {
+    const mock = createMockClient({ respond: pipelineResponder({ analysis: analysis(), specs: specs() }), createDelayMs: 30 })
+    const context = makeContext(mock.client, { phaseTimeoutMs: 1 })
+
+    const error = await runOrchestration(context, LONG_PROMPT, "auto").catch(e => e)
+
+    expect(error).toBeInstanceOf(OrchestrationError)
+    expect(error.phase).toBe("analyze")
+    expect(error.message).toContain("phase timeout")
+    expect(error.recoverable).toBe(true)
+    expect(mock.state.deleted).toEqual(mock.state.created)
+  })
+
+  test("stops immediately when the caller aborts", async () => {
+    const mock = createMockClient({ respond: pipelineResponder({ analysis: analysis(), specs: specs() }) })
+    const controller = new AbortController()
+    controller.abort()
+    const context = makeContext(mock.client)
+    context.abort = controller.signal
+
+    await expect(runOrchestration(context, LONG_PROMPT, "auto")).rejects.toThrow(/abort/i)
+  })
+
+  test("createTimeoutSignal aborts on timeout and stays quiet after dispose", async () => {
+    const timed = createTimeoutSignal(10)
+    expect(timed.signal.aborted).toBe(false)
+    await delay(30)
+    expect(timed.signal.aborted).toBe(true)
+
+    const disposed = createTimeoutSignal(10)
+    disposed.dispose()
+    await delay(30)
+    expect(disposed.signal.aborted).toBe(false)
+  })
+})
+
+describe("getOrchestrateTool", () => {
+  test("returns a diagram plus an execution summary", async () => {
+    const mock = createMockClient({ respond: pipelineResponder({ analysis: analysis(), specs: specs() }) })
+
+    const tool = getOrchestrateTool(mock.client, { id: "p1" }, process.cwd(), process.cwd(), {})
+    const output = await tool.execute({ prompt: LONG_PROMPT }, { abort: new AbortController().signal })
+
+    expect(typeof output).toBe("string")
+    expect(output).toContain("# Orchestration Diagram")
+    expect(output).toContain("## Task Analysis")
+    expect(output).toContain("## Result")
+    expect(output).toContain("FINAL SYNTHESIZED RESULT")
+    expect(output).toContain("## Execution Summary")
+    expect(output).toContain("Agents spawned: 2")
+    expect(output).toContain("Consensus strategy: debate")
+    expect(mock.state.deleted).toEqual(mock.state.created)
+  })
+
+  test("returns a structured failure message instead of throwing", async () => {
+    const mock = createMockClient({ failCreate: true })
+
+    const tool = getOrchestrateTool(mock.client, { id: "p1" }, process.cwd(), process.cwd(), { maxRetries: 0 })
+    const output = await tool.execute({ prompt: LONG_PROMPT }, { abort: new AbortController().signal })
+
+    expect(output).toContain("## Orchestration Failed")
+    expect(output).toContain("createChildSession")
+    expect(output).toContain("Recoverable:")
+  })
+
+  test("passes plugin options through to the engine", async () => {
+    const mock = createMockClient({ respond: pipelineResponder({ analysis: analysis(), specs: specs() }) })
+
+    // progress disabled => no [Progress] logs, proving the option reached the engine
+    const tool = getOrchestrateTool(mock.client, { id: "p1" }, process.cwd(), process.cwd(), { enableProgress: false })
+    await tool.execute({ prompt: LONG_PROMPT }, { abort: new AbortController().signal })
+
+    expect(mock.state.logs.some(m => m.startsWith("[Progress]"))).toBe(false)
+  })
+
+  test("emits progress logs by default", async () => {
+    const mock = createMockClient({ respond: pipelineResponder({ analysis: analysis(), specs: specs() }) })
+
+    const tool = getOrchestrateTool(mock.client, { id: "p1" }, process.cwd(), process.cwd(), {})
+    await tool.execute({ prompt: LONG_PROMPT }, { abort: new AbortController().signal })
+
+    expect(mock.state.logs.some(m => m.startsWith("[Progress]"))).toBe(true)
+  })
+})

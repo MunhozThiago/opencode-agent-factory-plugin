@@ -3,20 +3,12 @@ description: Run orchestration with detailed execution logging and step-by-step 
 agent: dynamic-orchestrator
 ---
 
-Execute the dynamic orchestration workflow for: $ARGUMENTS
+The user has invoked the `/orchestrate-debug` command with the following task:
 
-**DEBUG MODE** - Provide detailed logging at each phase:
+$ARGUMENTS
 
-1. ANALYZE - Output the full task analysis JSON before proceeding
-2. PLAN - Show each agent specification generated
-3. EXECUTE - Log each task spawn with agent config
-4. CONSENSUS - Display consensus process and convergence metrics
-5. SYNTHESIZE - Show how final output was constructed
+You MUST now call the `orchestrate` tool with the user's task as the `prompt` argument. Do NOT attempt to analyze, plan, or execute anything yourself. Simply invoke the tool:
 
-At each phase, pause and confirm before continuing.
+orchestrate(prompt: "$ARGUMENTS")
 
-Return complete execution trace with:
-- All intermediate JSON structures
-- Timing per agent and per group
-- Consensus convergence metrics
-- Any failures and recoveries
+Return the tool's result directly to the user.

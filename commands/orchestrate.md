@@ -3,14 +3,12 @@ description: Run a dynamic multi-agent workflow: analyze prompt, generate agents
 agent: dynamic-orchestrator
 ---
 
-Execute the full dynamic orchestration workflow for: $ARGUMENTS
+The user has invoked the `/orchestrate` command with the following task:
 
-Follow the 6-phase process defined in your agent instructions:
+$ARGUMENTS
 
-1. ANALYZE - Understand the task, extract complexity, domains, capabilities
-2. PLAN - Generate agent specifications via agent-factory
-3. EXECUTE - Run agents in parallel DAG via execution-engine
-4. CONSENSUS - Apply consensus strategy via consensus-manager
-5. SYNTHESIZE - Produce final unified result
+You MUST now call the `orchestrate` tool with the user's task as the `prompt` argument. Do NOT attempt to analyze, plan, or execute anything yourself. Simply invoke the tool:
 
-Return the final result with execution summary.
+orchestrate(prompt: "$ARGUMENTS")
+
+Return the tool's result directly to the user.

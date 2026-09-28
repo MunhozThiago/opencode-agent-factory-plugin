@@ -48,8 +48,8 @@ User Prompt
 [2. PLAN]     -- agent-factory generates agent specifications (roles, prompts, tools, deps)
     |
     v
-[3. EXECUTE]  -- execution-engine spawns agents in parallel groups via SDK sessions
-    |
+[3. EXECUTE]  -- native DAG scheduler runs agents in parallel waves via SDK sessions,
+    |             injecting dependency outputs from the previous wave
     v
 [4. CONSENSUS]-- consensus-manager unifies outputs via selected strategy
     |
@@ -59,6 +59,8 @@ User Prompt
     v
 Final Result + Execution Summary
 ```
+
+Tasks marked `single`, or auto-detected prompts shorter than `fastPathThresholdChars`, take a fast path that skips straight to agent generation and synthesis.
 
 ### What Makes This Different From Built-in Sub-Agents
 
@@ -82,7 +84,7 @@ Analyzes task complexity and generates agent specifications. Creates specialized
 
 ### execution-engine
 
-Executes agent DAGs with parallel group scheduling. Spawns agents via SDK sessions in parallel groups, handles dependency injection, timeouts, retries, and failure recovery. Outputs structured execution results.
+Bundled reference definition for DAG execution. Phase 3 no longer spawns this agent: the plugin now schedules the generated agents itself, in parallel waves, with dependency injection, timeouts and retries.
 
 ### consensus-manager
 
@@ -141,22 +143,24 @@ Metrics include: total orchestrations, success/failure rates, average execution 
 
 ## Configuration
 
-Configure the plugin via `opencode.json`:
+Configure the plugin via `opencode.json`. Options are passed as the second element of the plugin tuple:
 
 ```json
 {
-  "plugin": ["opencode-agent-factory-plugin"],
-  "option": {
-    "opencode-agent-factory-plugin": {
-      "overallTimeoutMs": 300000,
-      "phaseTimeoutMs": 120000,
-      "maxRetries": 2,
-      "baseRetryDelayMs": 1000,
-      "enableProgress": true,
-      "fastPathThresholdChars": 500,
-      "defaultStrategy": "auto"
-    }
-  }
+  "plugin": [
+    [
+      "opencode-agent-factory-plugin",
+      {
+        "overallTimeoutMs": 300000,
+        "phaseTimeoutMs": 120000,
+        "maxRetries": 2,
+        "baseRetryDelayMs": 1000,
+        "enableProgress": true,
+        "fastPathThresholdChars": 500,
+        "defaultStrategy": "auto"
+      }
+    ]
+  ]
 }
 ```
 
@@ -166,11 +170,18 @@ Configure the plugin via `opencode.json`:
 |--------|---------|-------------|
 | `overallTimeoutMs` | `300000` (5min) | Max total orchestration time |
 | `phaseTimeoutMs` | `120000` (2min) | Max time per phase |
-| `maxRetries` | `2` | Retry count for failed agents |
+| `maxRetries` | `2` | Retry count for failed phases/agents |
 | `baseRetryDelayMs` | `1000` | Base delay for exponential backoff |
 | `enableProgress` | `true` | Stream progress events |
 | `fastPathThresholdChars` | `500` | Prompt length below which fast-path is used |
-| `defaultStrategy` | `"auto"` | Default consensus strategy |
+| `defaultStrategy` | `"auto"` | Default consensus strategy (`auto`, `single`, `debate`, `voting`, `expert_review`, `hierarchical`) |
+| `enablePersistentTelemetry` | `false` | Write telemetry snapshots to disk |
+| `telemetryPath` | `.agent-factory/telemetry.json` | Telemetry file location (relative to project dir) |
+| `enableTemplateLibrary` | `true` | Load saved analysis/plan templates |
+| `templateDirs` | `[.agent-factory/templates]` | Additional directories to load templates from |
+| `childAgent` | `"build"` | Agent used for every child session. Set this if your `default_agent` is an orchestrator (children must not call `orchestrate` again) |
+
+Invalid values (wrong type, out-of-range numbers, unknown strategy) fall back to the defaults above.
 
 To override agent settings, add them to your `opencode.json`:
 
@@ -223,6 +234,8 @@ git clone https://github.com/MunhozThiago/opencode-agent-factory-plugin.git
 cd opencode-agent-factory-plugin
 bun install
 bun run build
+bun run typecheck
+bun test
 ```
 
 ### Local Testing
@@ -242,7 +255,12 @@ opencode-agent-factory-plugin/
 ├── src/
 │   ├── index.ts              # Plugin entry point (orchestrate tool + hooks)
 │   ├── orchestrator.ts       # 5-phase SDK-driven orchestration engine
-│   └── index.test.ts         # Unit tests
+│   ├── mock-client.ts        # Shared test harness (mock SDK client)
+│   ├── index.test.ts         # Plugin lifecycle, tools, hooks
+│   ├── orchestrator.test.ts  # Options, validators, prompts, diagrams
+│   ├── orchestration.test.ts # End-to-end engine runs
+│   ├── dag.test.ts           # Native DAG execution
+│   └── goal.test.ts          # Goal tools
 ├── agents/
 │   ├── dynamic-orchestrator.md
 │   ├── agent-factory.md
