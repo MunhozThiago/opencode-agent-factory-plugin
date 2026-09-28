@@ -1,0 +1,12 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "emitDeclarationOnly": true,
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": false,
+    "outDir": "dist"
+  },
+  "include": ["src/index.ts", "src/orchestrator.ts"],
+  "exclude": ["src/**/*.test.ts", "src/mock-client.ts"]
+}
