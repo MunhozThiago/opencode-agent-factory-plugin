@@ -29,6 +29,7 @@ interface AgentFactoryPluginOptions {
   phaseTimeoutMs: number
   maxRetries: number
   baseRetryDelayMs: number
+  maxAgents: number
   enableProgress: boolean
   fastPathThresholdChars: number
   defaultStrategy: typeof VALID_STRATEGIES[number]
@@ -60,6 +61,7 @@ function getOptions(options?: PluginOptions, projectDir?: string): AgentFactoryP
     phaseTimeoutMs: numOption(options?.phaseTimeoutMs, DEFAULT_PHASE_TIMEOUT_MS, 1),
     maxRetries: Math.floor(numOption(options?.maxRetries, 2, 0)),
     baseRetryDelayMs: numOption(options?.baseRetryDelayMs, 1000, 0),
+    maxAgents: Math.floor(numOption(options?.maxAgents, 12, 1)),
     enableProgress: boolOption(options?.enableProgress, true),
     fastPathThresholdChars: numOption(options?.fastPathThresholdChars, 500, 0),
     defaultStrategy: normalizeStrategy(options?.defaultStrategy),
@@ -645,6 +647,10 @@ async function withRetry<T>(
       if (lastError.name === "AbortError" || (signal ?? context.abort).aborted || context.abort.aborted) {
         throw lastError
       }
+      // Non-recoverable errors (bad config/model) retrying only wastes the budget
+      if (lastError instanceof OrchestrationError && !lastError.recoverable) {
+        throw lastError
+      }
       if (attempt < maxRetries) {
         // Exponential backoff with jitter, capped at 10s
         const delay = Math.min(
@@ -780,7 +786,7 @@ function unwrapSpecList(raw: unknown): unknown[] | null {
 // Coerce a model-generated spec list into AgentSpec[]. Near-miss values (wrong
 // vocabulary, missing retry policy, object wrappers) are repaired instead of
 // failing the whole orchestration; every repair is reported as an issue.
-function normalizeAgentSpecs(raw: unknown): { specs: AgentSpec[]; issues: string[] } {
+function normalizeAgentSpecs(raw: unknown, maxAgents = 12): { specs: AgentSpec[]; issues: string[] } {
   const issues: string[] = []
   const list = unwrapSpecList(raw)
   if (!list) return { specs: [], issues: ["response was not an array of agent specs"] }
@@ -852,8 +858,54 @@ function normalizeAgentSpecs(raw: unknown): { specs: AgentSpec[]; issues: string
     })
   })
 
-  return { specs, issues }
+  const capped = specs.slice(0, maxAgents)
+  if (capped.length < specs.length) {
+    issues.push(`truncated ${specs.length} agent specs to maxAgents=${maxAgents}`)
+  }
+
+  // Resolve dependencies against the agents we are actually going to run:
+  // invented ids, self-references and ids dropped by the cap must not abort
+  // the whole orchestration.
+  const known = new Set(capped.map(s => s.id))
+  for (const spec of capped) {
+    const seenDeps = new Set<string>()
+    spec.depends_on = spec.depends_on.filter(dep => {
+      if (seenDeps.has(dep)) return false
+      seenDeps.add(dep)
+      if (dep === spec.id) {
+        issues.push(`spec "${spec.id}": dropped self-dependency`)
+        return false
+      }
+      if (!known.has(dep)) {
+        issues.push(`spec "${spec.id}": dropped unknown dependency "${dep}"`)
+        return false
+      }
+      return true
+    })
+  }
+
+  return { specs: capped, issues }
 }
+// Sleep that rejects as soon as the signal aborts, so a retry backoff cannot
+// outlive the orchestration timeout.
+function abortableDelay(ms: number, signal: AbortSignal, phase: string): Promise<void> {
+  if (signal.aborted) {
+    return Promise.reject(new OrchestrationError(`Aborted during ${phase} backoff`, phase, undefined, true))
+  }
+  if (ms <= 0) return Promise.resolve()
+  return new Promise((resolve, reject) => {
+    const onAbort = () => {
+      clearTimeout(timer)
+      reject(new OrchestrationError(`Aborted during ${phase} backoff`, phase, undefined, true))
+    }
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort)
+      resolve()
+    }, ms)
+    signal.addEventListener("abort", onAbort, { once: true })
+  })
+}
+
 // Generates AgentSpec[] from a child session and repairs near-miss output.
 // The model sometimes answers with prose (or does the task itself) instead of
 // JSON, so a failed parse is retried with an explicit JSON-only reminder.
@@ -887,7 +939,7 @@ async function generateAgentSpecs(
           true
         )
       }
-      const { specs, issues } = normalizeAgentSpecs(raw)
+      const { specs, issues } = normalizeAgentSpecs(raw, context.options.maxAgents)
       if (specs.length === 0) {
         throw new OrchestrationError(
           `No usable agent specs in the response: ${issues.slice(0, 5).join("; ") || "empty spec list"}`,
@@ -907,6 +959,9 @@ async function generateAgentSpecs(
             true
           )
       if (signal.aborted || context.abort.aborted) throw lastError
+      // A non-recoverable failure (bad model id, invalid API key, broken config)
+      // will fail identically on every attempt - don't burn retries on it.
+      if (!lastError.recoverable) throw lastError
       if (attempt + 1 < maxAttempts) {
         emitProgress(context, {
           phase,
@@ -915,6 +970,8 @@ async function generateAgentSpecs(
           message: `Agent spec generation failed, retrying (attempt ${attempt + 2}/${maxAttempts})`,
           metadata: { attempt: attempt + 2, maxAttempts }
         })
+        const backoff = Math.min(context.options.baseRetryDelayMs * Math.pow(2, attempt), 10000)
+        await abortableDelay(backoff, signal, phase)
       }
     }
   }
@@ -1132,19 +1189,12 @@ async function runNativeDAGExecution(
   
   // Build dependency graph
   const agentMap = new Map(specs.map(s => [s.id, s]))
-  
-  // Validate: check all dependency references exist
+
+  // Validate: warn on unknown tools, and drop dependency references that do
+  // not resolve (invented ids, self-references). A malformed spec list is
+  // repaired here rather than aborting the whole run; cycles are still fatal.
+  const sanitized: AgentSpec[] = []
   for (const spec of specs) {
-    for (const depId of spec.depends_on) {
-      if (!agentMap.has(depId)) {
-        throw new OrchestrationError(
-          `Agent "${spec.id}" depends on unknown agent "${depId}"`,
-          "dag-validation"
-        )
-      }
-    }
-    
-    // Validate: check tool names are valid
     const toolCheck = validateAgentTools(spec.tools)
     if (toolCheck.invalid.length > 0) {
       // Log warning but don't fail - tools may be custom
@@ -1156,7 +1206,21 @@ async function runNativeDAGExecution(
         metadata: { agentId: spec.id, invalidTools: toolCheck.invalid }
       })
     }
+
+    const resolved = spec.depends_on.filter(dep => dep !== spec.id && agentMap.has(dep))
+    const dropped = spec.depends_on.filter(dep => !resolved.includes(dep))
+    if (dropped.length > 0) {
+      emitProgress(context, {
+        phase: "validation",
+        step: `agent-${spec.id}-dep-warning`,
+        progress: 0,
+        message: `Agent "${spec.id}" has unresolvable dependencies, ignored: ${dropped.join(", ")}`,
+        metadata: { agentId: spec.id, droppedDeps: dropped }
+      })
+    }
+    sanitized.push(resolved.length === spec.depends_on.length ? spec : { ...spec, depends_on: resolved })
   }
+  specs = sanitized
   
   // Validate: detect dependency cycles using topological sort
   const visited = new Set<string>()
@@ -2070,6 +2134,7 @@ export {
   validateTaskAnalysis,
   validateAgentSpecs,
   normalizeAgentSpecs,
+  generateAgentSpecs,
   validateExecutionResult,
   validateConsensusResult,
   extractJson,

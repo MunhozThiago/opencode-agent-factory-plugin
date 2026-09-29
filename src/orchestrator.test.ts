@@ -5,6 +5,7 @@ import {
   validateTaskAnalysis,
   validateAgentSpecs,
   normalizeAgentSpecs,
+  generateAgentSpecs,
   validateExecutionResult,
   validateConsensusResult,
   validateInput,
@@ -18,7 +19,7 @@ import {
   generateOrchestrationDiagram,
   OrchestrationError,
 } from "./orchestrator"
-import { makeSpec } from "./mock-client"
+import { makeSpec, createMockClient, makeContext } from "./mock-client"
 
 // ============================================================
 // extractJson
@@ -281,6 +282,99 @@ describe("normalizeAgentSpecs", () => {
     expect(normalizeAgentSpecs("just text").specs).toEqual([])
     expect(normalizeAgentSpecs(null).issues.length).toBeGreaterThan(0)
     expect(normalizeAgentSpecs({ unrelated: true }).specs).toEqual([])
+  })
+
+  test("caps the spec count at maxAgents and reports the truncation", () => {
+    const many = Array.from({ length: 20 }, (_, i) => makeSpec({ id: `a${i}` }))
+    const { specs, issues } = normalizeAgentSpecs(many, 12)
+
+    expect(specs).toHaveLength(12)
+    expect(issues.join(" ")).toContain("maxAgents=12")
+    expect(validateAgentSpecs(specs)).toBe(true)
+  })
+
+  test("drops unknown and self dependencies instead of failing", () => {
+    const { specs, issues } = normalizeAgentSpecs([
+      makeSpec({ id: "a", depends_on: ["ghost", "a", "b", "b"] }),
+      makeSpec({ id: "b" }),
+    ])
+
+    expect(specs[0].depends_on).toEqual(["b"])
+    const joined = issues.join(" ")
+    expect(joined).toContain('unknown dependency "ghost"')
+    expect(joined).toContain("self-dependency")
+    expect(validateAgentSpecs(specs)).toBe(true)
+  })
+
+  test("drops dependencies pointing at agents removed by the cap", () => {
+    const many = Array.from({ length: 12 }, (_, i) => makeSpec({ id: `a${i}` }))
+    many.push(makeSpec({ id: "extra", depends_on: ["a11"] }))
+    many[0].depends_on = ["extra"]
+
+    const { specs, issues } = normalizeAgentSpecs(many, 12)
+
+    expect(specs.map(s => s.id)).not.toContain("extra")
+    expect(specs[0].depends_on).toEqual([])
+    expect(issues.join(" ")).toContain('unknown dependency "extra"')
+  })
+})
+
+describe("generateAgentSpecs", () => {
+  const ARGS = ["spec title", "phase2-plan", "SYSTEM", "USER"] as const
+
+  test("retries a prose response once and succeeds", async () => {
+    let calls = 0
+    const mock = createMockClient({
+      respond: () => {
+        calls += 1
+        return calls === 1
+          ? "Let me explain my plan instead of returning JSON."
+          : JSON.stringify([makeSpec({ id: "a" })])
+      },
+    })
+    const context = makeContext(mock.client, { maxRetries: 2, baseRetryDelayMs: 0 })
+
+    const { specs } = await generateAgentSpecs(context, ARGS[0], ARGS[1], ARGS[2], ARGS[3], context.abort, 0.5)
+
+    expect(calls).toBe(2)
+    expect(specs.map(s => s.id)).toEqual(["a"])
+  })
+
+  test("skips retries entirely for a non-recoverable error", async () => {
+    let calls = 0
+    const mock = createMockClient({
+      respond: () => {
+        calls += 1
+        throw new OrchestrationError("invalid api key", "phase2-plan")
+      },
+    })
+    const context = makeContext(mock.client, { maxRetries: 3, baseRetryDelayMs: 0 })
+
+    const error = await generateAgentSpecs(context, ARGS[0], ARGS[1], ARGS[2], ARGS[3], context.abort, 0.5)
+      .then(() => null)
+      .catch(e => e)
+
+    expect(error).toBeInstanceOf(OrchestrationError)
+    expect(error.recoverable).toBe(false)
+    expect(calls).toBe(1)
+  })
+
+  test("stops retrying once the abort signal fires", async () => {
+    let calls = 0
+    const mock = createMockClient({
+      respond: () => {
+        calls += 1
+        throw new OrchestrationError("failed", "phase2-plan", undefined, true)
+      },
+    })
+    const context = makeContext(mock.client, { maxRetries: 5, baseRetryDelayMs: 0 })
+    const abort = new AbortController()
+    abort.abort()
+
+    await expect(
+      generateAgentSpecs(context, ARGS[0], ARGS[1], ARGS[2], ARGS[3], abort.signal, 0.5)
+    ).rejects.toThrow()
+    expect(calls).toBe(0)
   })
 })
 

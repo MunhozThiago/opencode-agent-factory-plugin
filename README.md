@@ -157,6 +157,7 @@ Configure the plugin via `opencode.json`. Options are passed as the second eleme
         "phaseTimeoutMs": 120000,
         "maxRetries": 2,
         "baseRetryDelayMs": 1000,
+        "maxAgents": 12,
         "enableProgress": true,
         "fastPathThresholdChars": 500,
         "defaultStrategy": "auto"
@@ -174,6 +175,7 @@ Configure the plugin via `opencode.json`. Options are passed as the second eleme
 | `phaseTimeoutMs` | `120000` (2min) | Max time per phase |
 | `maxRetries` | `2` | Retry count for failed phases/agents |
 | `baseRetryDelayMs` | `1000` | Base delay for exponential backoff |
+| `maxAgents` | `12` | Max agents spawned per run; extra specs and unresolvable `depends_on` refs are dropped instead of failing |
 | `enableProgress` | `true` | Stream progress events |
 | `fastPathThresholdChars` | `500` | Prompt length below which fast-path is used |
 | `defaultStrategy` | `"auto"` | Default consensus strategy (`auto`, `single`, `debate`, `voting`, `expert_review`, `hierarchical`) |

@@ -110,14 +110,16 @@ describe("runNativeDAGExecution", () => {
     expect(promptD.user).toContain("c: OUTPUT[c]")
   })
 
-  test("rejects an unknown dependency before spawning anything", async () => {
+  test("drops an unknown dependency and still runs the agent", async () => {
     const specs = [makeSpec({ id: "a", depends_on: ["ghost"] })]
-    const { mock, context } = newFixture()
+    const { mock, context, progress } = newFixture({}, { respond: pipelineResponder({ specs }) })
 
-    const error = await runNativeDAGExecution(context, specs, "task", context.abort).catch(e => e)
-    expect(error).toBeInstanceOf(OrchestrationError)
-    expect(error.message).toContain('unknown agent "ghost"')
-    expect(mock.state.created).toHaveLength(0)
+    const result = await runNativeDAGExecution(context, specs, "task", context.abort)
+
+    expect(result.execution_metadata.completed).toBe(1)
+    expect(result.execution_metadata.failed).toBe(0)
+    expect(mock.state.prompts).toHaveLength(1)
+    expect(progress.some(p => p.step === "agent-a-dep-warning")).toBe(true)
   })
 
   test("rejects a dependency cycle", async () => {
