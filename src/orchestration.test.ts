@@ -160,6 +160,61 @@ describe("runOrchestration: pipeline selection", () => {
     expect(mock.state.prompts.some(p => p.system.includes("sole worker"))).toBe(true)
   })
 
+  test("runs a review round, applies fixes, then approves", async () => {
+    let reviewCalls = 0
+    const phaseFallback = pipelineResponder({ analysis: analysis("single"), specs: specs() })
+    const mock = createMockClient({
+      respond: prompt => {
+        if (prompt.system.includes("You are a strict but fair reviewer")) {
+          reviewCalls += 1
+          return reviewCalls === 1
+            ? JSON.stringify({ approved: false, issues: [{ agent_id: "a", description: "edge cases missing" }] })
+            : JSON.stringify({ approved: true, issues: [] })
+        }
+        return phaseFallback(prompt)
+      },
+    })
+    const context = makeContext(mock.client, { maxReviewRounds: 2 })
+    const progress: string[] = []
+    context.onProgress = event => progress.push(event.step)
+
+    const result = await runOrchestration(context, LONG_PROMPT, "auto")
+
+    expect(reviewCalls).toBe(2)
+    expect(progress).toContain("review-round")
+    expect(progress).toContain("review-issues")
+    expect(progress).toContain("review-fixes")
+    expect(progress).toContain("review-approved")
+    expect(result.result).toBe("FINAL SYNTHESIZED RESULT")
+    expect(result.metadata.phases_completed).toBe(5)
+    const fixPrompt = mock.state.prompts.find(p => p.user.includes("DID NOT PASS REVIEW"))
+    expect(fixPrompt).toBeDefined()
+    expect(fixPrompt!.user).toContain("edge cases missing")
+  })
+
+  test("stops after maxReviewRounds and reports unresolved issues to synthesis", async () => {
+    let reviewCalls = 0
+    const phaseFallback = pipelineResponder({ analysis: analysis("single"), specs: specs() })
+    const mock = createMockClient({
+      respond: prompt => {
+        if (prompt.system.includes("You are a strict but fair reviewer")) {
+          reviewCalls += 1
+          return JSON.stringify({ approved: false, issues: [{ agent_id: "a", description: "still wrong" }] })
+        }
+        return phaseFallback(prompt)
+      },
+    })
+    const context = makeContext(mock.client, { maxReviewRounds: 1 })
+    const progress: string[] = []
+    context.onProgress = event => progress.push(event.step)
+
+    const result = await runOrchestration(context, LONG_PROMPT, "auto")
+
+    expect(reviewCalls).toBe(2)
+    expect(progress).not.toContain("review-approved")
+    expect(result.result).toBe("FINAL SYNTHESIZED RESULT")
+  })
+
   test("uses the fast path for a short auto prompt under the default threshold", async () => {
     const mock = createMockClient({ respond: pipelineResponder({ specs: specs() }) })
     const context = makeContext(mock.client)
@@ -280,7 +335,7 @@ describe("runOrchestration: failures, cleanup and telemetry", () => {
     const snapshot = getTelemetrySnapshot()
     expect(snapshot.fastPathUsage).toBe(1)
     expect(snapshot.complexPathUsage).toBe(0)
-    expect(Object.keys(snapshot.phaseTimings)).toEqual(["fast-path", "execute", "synthesize"])
+    expect(Object.keys(snapshot.phaseTimings)).toEqual(["fast-path", "execute", "review", "synthesize"])
   })
 
   test("records a failed run", async () => {

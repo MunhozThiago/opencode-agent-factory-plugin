@@ -30,6 +30,8 @@ interface AgentFactoryPluginOptions {
   maxRetries: number
   baseRetryDelayMs: number
   maxAgents: number
+  enableReviewLoop: boolean
+  maxReviewRounds: number
   enableProgress: boolean
   fastPathThresholdChars: number
   defaultStrategy: typeof VALID_STRATEGIES[number]
@@ -62,6 +64,8 @@ function getOptions(options?: PluginOptions, projectDir?: string): AgentFactoryP
     maxRetries: Math.floor(numOption(options?.maxRetries, 2, 0)),
     baseRetryDelayMs: numOption(options?.baseRetryDelayMs, 1000, 0),
     maxAgents: Math.floor(numOption(options?.maxAgents, 12, 1)),
+    enableReviewLoop: boolOption(options?.enableReviewLoop, true),
+    maxReviewRounds: Math.min(Math.floor(numOption(options?.maxReviewRounds, 1, 0)), 3),
     enableProgress: boolOption(options?.enableProgress, true),
     fastPathThresholdChars: numOption(options?.fastPathThresholdChars, 500, 0),
     defaultStrategy: normalizeStrategy(options?.defaultStrategy),
@@ -540,6 +544,9 @@ interface AgentSpec {
   output_format: "json" | "markdown" | "code" | "structured_text"
   timeout_ms: number
   retry_policy: { max_retries: number; simplify_on_retry: boolean }
+  /** File paths/globs this agent alone may write. Agents with overlapping
+   *  outputs are serialized into dependency order by normalizeAgentSpecs. */
+  outputs?: string[]
 }
 
 interface AgentExecutionResult {
@@ -772,6 +779,29 @@ function specStringList(value: unknown): string[] {
   return []
 }
 
+function normalizeOutputPath(value: string): string {
+  return value.trim().replace(/\\/g, "/").replace(/^\.\//, "").replace(/\/+$/, "").toLowerCase()
+}
+
+// Returns one shared path when two agents' write targets can collide
+// (identical path, one nested under the other, or overlapping glob prefixes).
+function sharedOutput(a?: string[], b?: string[]): string | null {
+  if (!a || !b || a.length === 0 || b.length === 0) return null
+  for (const x of a) {
+    for (const y of b) {
+      if (x === y) return x
+      if (x.startsWith(`${y}/`)) return x
+      if (y.startsWith(`${x}/`)) return y
+      const xBase = x.split("*")[0]
+      const yBase = y.split("*")[0]
+      if (xBase.length > 0 && yBase.length > 0 && (xBase.startsWith(yBase) || yBase.startsWith(xBase))) {
+        return x
+      }
+    }
+  }
+  return null
+}
+
 function unwrapSpecList(raw: unknown): unknown[] | null {
   if (Array.isArray(raw)) return raw
   if (raw && typeof raw === "object") {
@@ -845,6 +875,12 @@ function normalizeAgentSpecs(raw: unknown, maxAgents = 12): { specs: AgentSpec[]
     }
     seenIds.add(id)
 
+    const outputs = Array.from(new Set(
+      specStringList(source.outputs ?? source.output_files ?? source.writes ?? source.files)
+        .map(normalizeOutputPath)
+        .filter(Boolean)
+    ))
+
     specs.push({
       id,
       role,
@@ -856,6 +892,7 @@ function normalizeAgentSpecs(raw: unknown, maxAgents = 12): { specs: AgentSpec[]
       output_format: OUTPUT_FORMAT_ALIASES[rawFormat] ?? "markdown",
       timeout_ms: timeoutMs,
       retry_policy: retryPolicy,
+      ...(outputs.length > 0 ? { outputs } : {}),
     })
   })
 
@@ -883,6 +920,35 @@ function normalizeAgentSpecs(raw: unknown, maxAgents = 12): { specs: AgentSpec[]
       }
       return true
     })
+  }
+
+  // File-producing agents: agents that can write the same file are serialized
+  // into dependency order, so writes happen in parallel only when they cannot
+  // collide. Already-ordered pairs are left alone.
+  const reaches = (from: string, to: string): boolean => {
+    const stack = [from]
+    const seen = new Set<string>()
+    while (stack.length > 0) {
+      const current = stack.pop()!
+      if (current === to) return true
+      if (seen.has(current)) continue
+      seen.add(current)
+      const spec = capped.find(s => s.id === current)
+      if (spec) stack.push(...spec.depends_on)
+    }
+    return false
+  }
+  for (let i = 0; i < capped.length; i++) {
+    for (let j = i + 1; j < capped.length; j++) {
+      const earlier = capped[i]
+      const later = capped[j]
+      if (later.depends_on.includes(earlier.id) || earlier.depends_on.includes(later.id)) continue
+      if (reaches(later.id, earlier.id) || reaches(earlier.id, later.id)) continue
+      const shared = sharedOutput(earlier.outputs, later.outputs)
+      if (!shared) continue
+      later.depends_on.push(earlier.id)
+      issues.push(`spec "${later.id}": serialized behind "${earlier.id}" (overlapping output "${shared}")`)
+    }
   }
 
   return { specs: capped, issues }
@@ -1162,8 +1228,18 @@ function buildAgentPrompt(agent: AgentSpec, userTask: string, dependencyOutputs:
   const deps = Object.entries(dependencyOutputs)
     .map(([id, output]) => `${id}: ${output}`)
     .join("\n")
-  
-  return `${agent.prompt}
+
+  const ownership = agent.outputs && agent.outputs.length > 0
+    ? `
+
+FILE OWNERSHIP - you alone may write these files:
+${agent.outputs.map(o => `- ${o}`).join("\n")}
+
+Do not modify any file outside this list. Another agent owns the rest; pass
+coordination notes through your output instead of touching their files.`
+    : ""
+
+  return `${agent.prompt}${ownership}
 
 ORIGINAL TASK:
 ${userTask}
@@ -1438,15 +1514,237 @@ You are in Phase 4: CONSENSUS. Apply the consensus strategy. Output ONLY the Con
   return result
 }
 
-async function runPhase5Synthesize(context: OrchestratorContext, consensus: ConsensusResult, executionResult: ExecutionResult, signal: AbortSignal): Promise<string> {
+async function runPhase5Synthesize(
+  context: OrchestratorContext,
+  consensus: ConsensusResult,
+  executionResult: ExecutionResult,
+  signal: AbortSignal,
+  reviewNote?: string
+): Promise<string> {
   const child = await createChildSession(context, "dynamic-orchestrator:synthesize", signal)
   const orchestratorPrompt = getAgentPrompt("dynamic-orchestrator", context.customTemplates)
   const systemPrompt = `${orchestratorPrompt}
 
 You are in Phase 5: SYNTHESIZE. Compile the final response using the consensus output. Output ONLY the final answer.`
 
-  const response = await promptSession(context, child.id, systemPrompt, `Consensus result:\n${JSON.stringify(consensus, null, 2)}\n\nExecution metadata:\n${JSON.stringify(executionResult.execution_metadata, null, 2)}`, undefined, signal)
+  const note = reviewNote && reviewNote.length > 0
+    ? `\n\nREVIEW NOTES - issues the reviewer did NOT consider resolved; call them out in the final answer:\n${reviewNote}`
+    : ""
+  const response = await promptSession(
+    context,
+    child.id,
+    systemPrompt,
+    `Consensus result:\n${JSON.stringify(consensus, null, 2)}\n\nExecution metadata:\n${JSON.stringify(executionResult.execution_metadata, null, 2)}${note}`,
+    undefined,
+    signal
+  )
   return response.parts.find((p: any) => p.type === "text")?.text ?? "No result produced"
+}
+
+interface ReviewOutcome {
+  approved: boolean
+  rounds: number
+  issues: string[]
+}
+
+// Build the specs for a fix pass: only the agents the reviewer flagged get a
+// round, each carrying its previous output and the issues to correct.
+function buildFixSpecs(
+  specs: AgentSpec[],
+  issues: Array<{ agent_id?: string; description: string }>,
+  results: Record<string, AgentExecutionResult>
+): AgentSpec[] {
+  const byAgent = new Map<string, string[]>()
+  const unattributed: string[] = []
+  for (const issue of issues) {
+    const description = typeof issue?.description === "string" ? issue.description.trim() : ""
+    if (!description) continue
+    const target = typeof issue?.agent_id === "string" && specs.some(s => s.id === issue.agent_id)
+      ? issue.agent_id
+      : null
+    if (target) {
+      if (!byAgent.has(target)) byAgent.set(target, [])
+      byAgent.get(target)!.push(description)
+    } else {
+      unattributed.push(description)
+    }
+  }
+
+  const fixSpecs: AgentSpec[] = []
+  for (const spec of specs) {
+    const own = [...(byAgent.get(spec.id) ?? []), ...unattributed]
+    if (own.length === 0) continue
+    const previous = results[spec.id]?.output ?? ""
+    fixSpecs.push({
+      ...spec,
+      depends_on: [],
+      prompt: `${spec.prompt}
+
+YOUR PREVIOUS OUTPUT DID NOT PASS REVIEW. Fix these issues:
+${own.map(i => `- ${i}`).join("\n")}
+
+PREVIOUS OUTPUT:
+${previous.slice(0, 6000)}
+
+Return the corrected deliverable in full.`,
+    })
+  }
+  return fixSpecs
+}
+
+// Validation loop: a reviewer agent grades the deliverables, flagged agents
+// revise, and the cycle repeats up to maxReviewRounds times (like a team's
+// review -> fix -> re-review pass). Fails open when the reviewer is
+// unavailable or unparseable so review can never sink a good run.
+async function runReviewLoop(
+  context: OrchestratorContext,
+  signal: AbortSignal,
+  userTask: string,
+  specs: AgentSpec[],
+  execution: ExecutionResult
+): Promise<{ execution: ExecutionResult; review: ReviewOutcome }> {
+  const noop = (exec: ExecutionResult, rounds: number) =>
+    ({ execution: exec, review: { approved: true, rounds, issues: [] } })
+
+  if (!context.options.enableReviewLoop || specs.length === 0 || execution.execution_metadata.total_agents === 0) {
+    return noop(execution, 0)
+  }
+
+  const results: Record<string, AgentExecutionResult> = { ...execution.results }
+  const maxRounds = context.options.maxReviewRounds
+  let approved = false
+  let rounds = 0
+  let openIssues: string[] = []
+
+  for (let round = 0; round <= maxRounds; round++) {
+    rounds = round + 1
+    emitProgress(context, {
+      phase: "review",
+      step: "review-round",
+      progress: 75,
+      message: `Review round ${rounds} of at most ${maxRounds + 1}`,
+      metadata: { round: rounds, maxRounds: maxRounds + 1 }
+    })
+
+    let verdict: { approved: boolean; issues: Array<{ agent_id?: string; description: string }> } | null = null
+    try {
+      verdict = await withPhase(context, signal, "review", async (phaseSignal) => {
+        const child = await createChildSession(context, `reviewer:round-${rounds}`, phaseSignal)
+        const systemPrompt = `You are a strict but fair reviewer on a delivery team.
+Review the deliverables against the task: correctness, completeness, internal consistency, and every requested item being present.
+Output ONLY this JSON and nothing else: {"approved": boolean, "issues": [{"agent_id": string, "description": string}]}
+Set approved to true only when the work is ready to ship as-is. Attribute each issue to the agent id that produced that deliverable.`
+        const userPrompt = `TASK:
+${userTask}
+
+DELIVERABLES:
+${Object.entries(results)
+  .map(([id, r]) => `### ${id} (${r.status})\n${(r.output || r.error || "").slice(0, 8000)}`)
+  .join("\n\n")}`
+        const response = await promptSession(context, child.id, systemPrompt, userPrompt, undefined, phaseSignal)
+        const text = response.parts.find((p: any) => p.type === "text")?.text ?? ""
+        const parsed = extractJson<{ approved?: unknown; issues?: unknown }>(text)
+        if (!parsed || typeof parsed.approved !== "boolean") return null
+        const issues = Array.isArray(parsed.issues)
+          ? (parsed.issues as Array<{ agent_id?: unknown; description: unknown }>)
+              .filter(i => i && typeof i.description === "string")
+              .map(i => ({
+                ...(typeof i.agent_id === "string" ? { agent_id: i.agent_id } : {}),
+                description: i.description as string,
+              }))
+          : []
+        return { approved: parsed.approved, issues }
+      })
+    } catch (error) {
+      if (signal.aborted || context.abort.aborted) throw error
+      emitProgress(context, {
+        phase: "review",
+        step: "review-skipped",
+        progress: 80,
+        message: `Reviewer unavailable (${error instanceof Error ? error.message : String(error)}); skipping review`,
+        metadata: { round: rounds }
+      })
+      return noop({ ...execution, results }, rounds)
+    }
+
+    if (!verdict) {
+      emitProgress(context, {
+        phase: "review",
+        step: "review-skipped",
+        progress: 80,
+        message: "Reviewer response was not valid JSON; skipping review",
+        metadata: { round: rounds }
+      })
+      return noop({ ...execution, results }, rounds)
+    }
+
+    if (verdict.approved) {
+      approved = true
+      emitProgress(context, {
+        phase: "review",
+        step: "review-approved",
+        progress: 85,
+        message: `Deliverables approved on review round ${rounds}`,
+        metadata: { round: rounds }
+      })
+      break
+    }
+
+    openIssues = verdict.issues.map(i => `${i.agent_id ?? "unknown"}: ${i.description}`)
+    if (openIssues.length === 0) {
+      approved = true
+      emitProgress(context, {
+        phase: "review",
+        step: "review-approved",
+        progress: 85,
+        message: `Deliverables approved on review round ${rounds} (no issues listed)`,
+        metadata: { round: rounds }
+      })
+      break
+    }
+    emitProgress(context, {
+      phase: "review",
+      step: "review-issues",
+      progress: 75,
+      message: `Review round ${rounds} found ${openIssues.length} issue(s)`,
+      metadata: { round: rounds, issues: openIssues }
+    })
+
+    if (round === maxRounds) break
+
+    const fixSpecs = buildFixSpecs(specs, verdict.issues, results)
+    if (fixSpecs.length === 0) break
+
+    try {
+      const fixExecution = await withPhase(context, signal, "review-fix", phaseSignal =>
+        runNativeDAGExecution(context, fixSpecs, userTask, phaseSignal))
+      for (const [id, result] of Object.entries(fixExecution.results)) {
+        results[id] = result
+      }
+      emitProgress(context, {
+        phase: "review",
+        step: "review-fixes",
+        progress: 80,
+        message: `Fix pass complete for ${fixSpecs.length} agent(s)`,
+        metadata: { round: rounds, agentsFixed: fixSpecs.map(s => s.id) }
+      })
+    } catch (error) {
+      if (signal.aborted || context.abort.aborted) throw error
+      emitProgress(context, {
+        phase: "review",
+        step: "review-fix-failed",
+        progress: 80,
+        message: `Fix pass failed (${error instanceof Error ? error.message : String(error)})`,
+        metadata: { round: rounds }
+      })
+      break
+    }
+  }
+
+  return {
+    execution: { ...execution, results },
+    review: { approved, rounds, issues: openIssues },
+  }
 }
 
 export async function runOrchestration(context: OrchestratorContext, userPrompt: string, strategy: string = "auto"): Promise<{
@@ -1613,15 +1911,25 @@ You are handling a SIMPLE task. Do NOT perform the task yourself: no file writes
   // The generated agents still have to do the work: run them through the same
   // DAG scheduler as the complex path, then adopt the primary output.
   const execStart = Date.now()
-  const execution = await withPhase(context, signal, "execute", phaseSignal =>
+  const baseExecution = await withPhase(context, signal, "execute", phaseSignal =>
     runNativeDAGExecution(context, specs, userPrompt, phaseSignal))
   const execMs = Date.now() - execStart
+
+  const reviewStart = Date.now()
+  const { execution, review } = await runReviewLoop(context, signal, userPrompt, specs, baseExecution)
+  const reviewMs = Date.now() - reviewStart
 
   const consensus = buildSingleConsensus(specs, execution)
 
   const synthStart = Date.now()
   const finalResult = await withPhase(context, signal, "synthesize", phaseSignal =>
-    runPhase5Synthesize(context, consensus, execution, phaseSignal))
+    runPhase5Synthesize(
+      context,
+      consensus,
+      execution,
+      phaseSignal,
+      review.approved ? undefined : review.issues.join("\n")
+    ))
   const synthMs = Date.now() - synthStart
   
   const totalTime = Date.now() - startTime
@@ -1652,7 +1960,12 @@ You are handling a SIMPLE task. Do NOT perform the task yourself: no file writes
       execution,
       consensus,
       strategyReasoning: `Fast-path selected: task complexity is simple, using single strategy for direct execution.`,
-      phaseTimings: { "fast-path": specMs, execute: execMs, synthesize: synthMs },
+      phaseTimings: {
+        "fast-path": specMs,
+        execute: execMs,
+        ...(review.rounds > 0 ? { review: reviewMs } : {}),
+        synthesize: synthMs
+      },
     }
   }
 }
@@ -1798,7 +2111,7 @@ You are in Phase 2: PLAN. Generate agent specifications from the analysis. Do NO
     metadata: { agentCount: specs.length }
   })
   
-  const execution = await withPhase(context, signal, "execute", phaseSignal =>
+  let execution = await withPhase(context, signal, "execute", phaseSignal =>
     runPhase3Execute(context, specs, userPrompt, phaseSignal)
   )
   phaseTimings["execute"] = Date.now() - phase3Start
@@ -1810,6 +2123,15 @@ You are in Phase 2: PLAN. Generate agent specifications from the analysis. Do NO
     message: `Execution complete: ${execution.execution_metadata.completed}/${execution.execution_metadata.total_agents} agents succeeded`,
     metadata: { completed: execution.execution_metadata.completed, total: execution.execution_metadata.total_agents }
   })
+
+  // Review -> fix -> re-review loop before consensus, so the team's output is
+  // validated like a real delivery pass rather than trusted on first draft.
+  const reviewStart = Date.now()
+  const reviewOutcome = await runReviewLoop(context, signal, userPrompt, specs, execution)
+  execution = reviewOutcome.execution
+  if (reviewOutcome.review.rounds > 0) {
+    phaseTimings["review"] = Date.now() - reviewStart
+  }
 
   const finalStrategy = strategy !== "auto" ? strategy : analysis.consensus_strategy
   
@@ -1868,8 +2190,13 @@ You are in Phase 2: PLAN. Generate agent specifications from the analysis. Do NO
   })
   
   const finalResult = await withPhase(context, signal, "synthesize", phaseSignal =>
-    runPhase5Synthesize(context, consensus, execution, phaseSignal)
-  )
+    runPhase5Synthesize(
+      context,
+      consensus,
+      execution,
+      phaseSignal,
+      reviewOutcome.review.approved ? undefined : reviewOutcome.review.issues.join("\n")
+    ))
   phaseTimings["synthesize"] = Date.now() - phase5Start
   
   const totalTime = Date.now() - startTime

@@ -317,6 +317,42 @@ describe("normalizeAgentSpecs", () => {
     expect(specs[0].depends_on).toEqual([])
     expect(issues.join(" ")).toContain('unknown dependency "extra"')
   })
+
+  test("serializes agents that can write the same file", () => {
+    const { specs, issues } = normalizeAgentSpecs([
+      makeSpec({ id: "a", outputs: ["src/app.ts"] }),
+      makeSpec({ id: "b", outputs: ["src/app.ts"] }),
+    ])
+
+    expect(specs[1].depends_on).toEqual(["a"])
+    expect(issues.join(" ")).toContain('serialized behind "a"')
+    expect(validateAgentSpecs(specs)).toBe(true)
+  })
+
+  test("serializes nested write targets but keeps disjoint owners parallel", () => {
+    const nested = normalizeAgentSpecs([
+      makeSpec({ id: "a", outputs: ["docs"] }),
+      makeSpec({ id: "b", outputs: ["docs/api.md"] }),
+    ])
+    expect(nested.specs[1].depends_on).toEqual(["a"])
+
+    const disjoint = normalizeAgentSpecs([
+      makeSpec({ id: "a", outputs: ["src/a.ts"] }),
+      makeSpec({ id: "b", outputs: ["src/b.ts"] }),
+    ])
+    expect(disjoint.specs[1].depends_on).toEqual([])
+    expect(disjoint.issues).toEqual([])
+  })
+
+  test("keeps an already-ordered pair as-is even with overlapping outputs", () => {
+    const { specs, issues } = normalizeAgentSpecs([
+      makeSpec({ id: "a", outputs: ["src/app.ts"] }),
+      makeSpec({ id: "b", outputs: ["src/app.ts"], depends_on: ["a"] }),
+    ])
+
+    expect(specs[1].depends_on).toEqual(["a"])
+    expect(issues).toEqual([])
+  })
 })
 
 describe("generateAgentSpecs", () => {
@@ -642,6 +678,18 @@ describe("buildAgentPrompt", () => {
     const prompt = buildAgentPrompt(spec, "Build a todo app", { root: "root output" })
     expect(prompt).toContain("DEPENDENCY OUTPUTS FROM PRIOR AGENTS")
     expect(prompt).toContain("root: root output")
+  })
+
+  test("injects file ownership rules when the agent owns outputs", () => {
+    const prompt = buildAgentPrompt(makeSpec({ id: "a", outputs: ["src/app.ts"] }), "Build a todo app", {})
+    expect(prompt).toContain("FILE OWNERSHIP")
+    expect(prompt).toContain("src/app.ts")
+    expect(prompt).toContain("Do not modify any file outside this list")
+  })
+
+  test("omits ownership rules for agents without outputs", () => {
+    const prompt = buildAgentPrompt(spec, "Build a todo app", {})
+    expect(prompt).not.toContain("FILE OWNERSHIP")
   })
 })
 

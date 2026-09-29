@@ -62,7 +62,11 @@ Final Result + Execution Summary
 
 Tasks marked `single`, or auto-detected prompts shorter than `fastPathThresholdChars`, take a fast path that skips analysis and consensus: agents are generated, run through the same DAG scheduler, and synthesized.
 
-Spec output that is close-but-not-quite (unknown model tier, wrapper objects instead of a bare array, prose instead of JSON) is repaired or retried rather than failing the whole run, so a single sloppy model response does not abort the orchestration.
+Spec output that is close-but-not-quite (unknown model tier, wrapper objects instead of a bare array, prose instead of JSON) is repaired or retried rather than failing the whole run, so a single sloppy model response does not abort the orchestration. If the planner still fails, the run falls back to a trimmed brief and then to a single locally-built agent instead of returning a hard error.
+
+**File-producing work (coding, writing, creative).** Agents can declare an `outputs` list (paths or globs they may write). Agents with overlapping `outputs` are automatically serialized into dependency order, and each agent gets an explicit "you alone own these files" instruction — so work runs *in parallel* when files are disjoint and never *concurrently* on the same file.
+
+**Validation loop.** After execution a reviewer agent grades the deliverables like a teammate's review pass: flagged agents get a fix round carrying their previous output and the issues, then it re-reviews — up to `maxReviewRounds` times. Unresolved issues are handed to synthesis so they are called out in the final answer. Disable with `enableReviewLoop: false`.
 
 ### What Makes This Different From Built-in Sub-Agents
 
@@ -158,6 +162,8 @@ Configure the plugin via `opencode.json`. Options are passed as the second eleme
         "maxRetries": 2,
         "baseRetryDelayMs": 1000,
         "maxAgents": 12,
+        "enableReviewLoop": true,
+        "maxReviewRounds": 1,
         "enableProgress": true,
         "fastPathThresholdChars": 500,
         "defaultStrategy": "auto"
@@ -176,6 +182,8 @@ Configure the plugin via `opencode.json`. Options are passed as the second eleme
 | `maxRetries` | `2` | Retry count for failed phases/agents |
 | `baseRetryDelayMs` | `1000` | Base delay for exponential backoff |
 | `maxAgents` | `12` | Max agents spawned per run; extra specs and unresolvable `depends_on` refs are dropped instead of failing |
+| `enableReviewLoop` | `true` | Review → fix → re-review pass after execution (fails open if the reviewer is unavailable) |
+| `maxReviewRounds` | `1` (max 3) | Fix rounds allowed after the first review; unresolved issues go to synthesis |
 | `enableProgress` | `true` | Stream progress events |
 | `fastPathThresholdChars` | `500` | Prompt length below which fast-path is used |
 | `defaultStrategy` | `"auto"` | Default consensus strategy (`auto`, `single`, `debate`, `voting`, `expert_review`, `hierarchical`) |
