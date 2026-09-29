@@ -133,6 +133,33 @@ describe("runOrchestration: pipeline selection", () => {
     expect(result.diagram.consensus!.final_output).toBe("OUTPUT[a]")
   })
 
+  test("degrades to a single local agent when the planner keeps failing", async () => {
+    let planCalls = 0
+    const phaseFallback = pipelineResponder({ analysis: analysis(), specs: specs() })
+    const mock = createMockClient({
+      respond: prompt => {
+        if (prompt.system.includes("Phase 2: PLAN")) {
+          planCalls += 1
+          throw new OrchestrationError("planner exploded", "phase2-plan", undefined, true)
+        }
+        return phaseFallback(prompt)
+      },
+    })
+    const context = makeContext(mock.client, { maxRetries: 0, baseRetryDelayMs: 0 })
+    const progress: string[] = []
+    context.onProgress = event => progress.push(event.step)
+
+    const result = await runOrchestration(context, LONG_PROMPT, "auto")
+
+    expect(planCalls).toBe(4)
+    expect(progress).toContain("plan-fallback")
+    expect(progress).toContain("plan-degraded")
+    expect(result.metadata.agents_spawned).toBe(1)
+    expect(result.metadata.phases_completed).toBe(5)
+    expect(result.result).toBe("FINAL SYNTHESIZED RESULT")
+    expect(mock.state.prompts.some(p => p.system.includes("sole worker"))).toBe(true)
+  })
+
   test("uses the fast path for a short auto prompt under the default threshold", async () => {
     const mock = createMockClient({ respond: pipelineResponder({ specs: specs() }) })
     const context = makeContext(mock.client)

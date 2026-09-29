@@ -603,16 +603,17 @@ async function withPhase<T>(
   context: OrchestratorContext,
   outerSignal: AbortSignal,
   phase: string,
-  fn: (phaseSignal: AbortSignal) => Promise<T>
+  fn: (phaseSignal: AbortSignal) => Promise<T>,
+  timeoutMs: number = context.options.phaseTimeoutMs
 ): Promise<T> {
   checkAbort(outerSignal, phase)
-  const { signal, dispose } = createTimeoutSignal(context.options.phaseTimeoutMs, outerSignal)
+  const { signal, dispose } = createTimeoutSignal(timeoutMs, outerSignal)
   try {
     return await fn(signal)
   } catch (error) {
     if (signal.aborted && !outerSignal.aborted) {
       throw new OrchestrationError(
-        `Phase "${phase}" exceeded phase timeout of ${context.options.phaseTimeoutMs}ms`,
+        `Phase "${phase}" exceeded phase timeout of ${timeoutMs}ms`,
         phase,
         error instanceof Error ? error : undefined,
         true
@@ -907,6 +908,30 @@ function abortableDelay(ms: number, signal: AbortSignal, phase: string): Promise
 }
 
 // Generates AgentSpec[] from a child session and repairs near-miss output.
+// Last-resort spec built locally (no LLM round-trip) when every planner
+// attempt failed: the run degrades to one agent covering the whole task
+// instead of returning a hard failure to the user.
+function soloAgentSpec(task: string, timeoutMs: number): AgentSpec {
+  return {
+    id: "solo-worker",
+    role: "Generalist",
+    goal: task.slice(0, 300),
+    prompt: [
+      "You are the sole worker on this task. Complete it end to end:",
+      "read the relevant context, do the work, and return the full deliverable",
+      "as your final message.",
+      "",
+      `Task: ${task}`,
+    ].join("\n"),
+    tools: ["read", "edit", "write", "bash", "glob", "grep", "webfetch", "websearch"],
+    model_tier: "powerful",
+    depends_on: [],
+    output_format: "markdown",
+    timeout_ms: timeoutMs,
+    retry_policy: { max_retries: 1, simplify_on_retry: true },
+  }
+}
+
 // The model sometimes answers with prose (or does the task itself) instead of
 // JSON, so a failed parse is retried with an explicit JSON-only reminder.
 async function generateAgentSpecs(
@@ -1684,7 +1709,9 @@ ${strategy !== "auto" ? `- User override: ${strategy}` : "- Auto-selected based 
     metadata: { taskType: analysis.task_type, complexity: analysis.complexity, domains: analysis.domains }
   })
 
-  // Phase 2: Plan
+  // Phase 2: Plan. A slow or failing planner must not sink the whole run:
+  // retry with a trimmed brief, then degrade to a locally-built single-agent
+  // spec so execution still produces a result.
   const phase2Start = Date.now()
   emitProgress(context, {
     phase: "plan",
@@ -1693,32 +1720,64 @@ ${strategy !== "auto" ? `- User override: ${strategy}` : "- Auto-selected based 
     message: "Generating agent specifications",
     metadata: { expectedAgents: "unknown" }
   })
-  
-  specs = await withPhase(context, signal, "plan", async (phaseSignal) => {
-    const planSystemPrompt = `${factoryPrompt}
+
+  const planSystemPrompt = `${factoryPrompt}
 
 You are in Phase 2: PLAN. Generate agent specifications from the analysis. Do NOT perform any of the work yourself: no file writes, no shell commands. Output ONLY the JSON array.`
 
-    const { specs: plannedSpecs, issues } = await generateAgentSpecs(
-      context,
-      "agent-factory:plan",
-      "phase2-plan",
-      planSystemPrompt,
-      JSON.stringify(analysis, null, 2),
-      phaseSignal,
-      30
-    )
-    if (issues.length > 0) {
+  const runPlan = (planBrief: string, timeoutMs?: number) =>
+    withPhase(context, signal, "plan", async (phaseSignal) => {
+      const { specs: plannedSpecs, issues } = await generateAgentSpecs(
+        context,
+        "agent-factory:plan",
+        "phase2-plan",
+        planSystemPrompt,
+        planBrief,
+        phaseSignal,
+        30
+      )
+      if (issues.length > 0) {
+        emitProgress(context, {
+          phase: "plan",
+          step: "spec-repair",
+          progress: 30,
+          message: `Repaired ${issues.length} agent spec issue(s)`,
+          metadata: { issueCount: issues.length }
+        })
+      }
+      return plannedSpecs
+    }, timeoutMs)
+
+  try {
+    specs = await runPlan(JSON.stringify(analysis, null, 2))
+  } catch (planError) {
+    if (signal.aborted || context.abort.aborted) throw planError
+    const planReason = planError instanceof Error ? planError.message : String(planError)
+    emitProgress(context, {
+      phase: "plan",
+      step: "plan-fallback",
+      progress: 30,
+      message: `Planner failed (${planReason}); retrying with a trimmed brief`,
+      metadata: { error: planReason }
+    })
+    try {
+      specs = await runPlan(
+        `Task: ${userPrompt}\n\nTask type: ${analysis.task_type}, complexity: ${analysis.complexity}.\nGenerate an AgentSpec[] of 1-3 agents that covers this task. Output ONLY the JSON array.`,
+        Math.max(Math.ceil(context.options.phaseTimeoutMs / 2), 1000)
+      )
+    } catch (trimError) {
+      if (signal.aborted || context.abort.aborted) throw planError
+      const trimReason = trimError instanceof Error ? trimError.message : String(trimError)
       emitProgress(context, {
         phase: "plan",
-        step: "spec-repair",
+        step: "plan-degraded",
         progress: 30,
-        message: `Repaired ${issues.length} agent spec issue(s)`,
-        metadata: { issueCount: issues.length }
+        message: `Planner unavailable (${trimReason}); degrading to a single-agent run`,
+        metadata: { error: trimReason }
       })
+      specs = [soloAgentSpec(userPrompt, context.options.phaseTimeoutMs)]
     }
-    return plannedSpecs
-  })
+  }
   phaseTimings["plan"] = Date.now() - phase2Start
   
   emitProgress(context, {
