@@ -539,7 +539,32 @@ describe("getOrchestrateTool", () => {
 
     expect(elapsed).toBeLessThan(900)
     expect(output).toContain("## Orchestration Failed")
-    expect(output).toContain("phase timeout")
+    expect(output).toContain("Recoverable:** no")
+    expect(output).not.toContain("Please try again or simplify")
+  })
+
+  test("marks a phase timeout as non-recoverable at the tool boundary", async () => {
+    const mock = createMockClient({
+      respond: pipelineResponder({ analysis: analysis(), specs: specs() }),
+      promptDelayMs: 1000,
+    })
+
+    const tool = getOrchestrateTool(mock.client, { id: "p1" }, process.cwd(), process.cwd(), {
+      phaseTimeoutMs: 200,
+      overallTimeoutMs: 60000,
+      maxRetries: 0,
+    })
+
+    const output = (await tool.execute(
+      { prompt: LONG_PROMPT },
+      { abort: new AbortController().signal }
+    )) as string
+
+    expect(output).toContain("## Orchestration Failed (analyze)")
+    expect(output).toContain("exceeded phase timeout")
+    expect(output).toContain("Recoverable:** no")
+    expect(output).toContain("phaseTimeoutMs")
+    expect(output).not.toContain("Please try again or simplify")
   })
 
   test("marks an exhausted overall time budget as non-recoverable", async () => {

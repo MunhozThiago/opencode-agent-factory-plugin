@@ -2619,11 +2619,14 @@ ${result.result}
           errorPhase: error instanceof OrchestrationError ? error.phase : undefined,
         })
         if (error instanceof OrchestrationError) {
-          // An exhausted overall budget is not transient: telling the caller
-          // "recoverable, please try again" makes orchestrating agents burn
-          // the same full budget again in a retry loop.
+          // Time-budget failures are not transient: answering "recoverable,
+          // please try again" makes orchestrating agents burn the same full
+          // budget again in a retry loop (observed live: 3+ back-to-back
+          // 300s attempts that all failed the same way).
+          const externalAbort = orchestratorContext.abort.aborted
           const budgetExhausted =
-            !orchestratorContext.abort.aborted && /^Operation aborted during /.test(error.message)
+            !externalAbort && /^Operation aborted during /.test(error.message)
+          const phaseTimedOut = !externalAbort && /exceeded phase timeout/.test(error.message)
           if (budgetExhausted) {
             return `## Orchestration Failed (${error.phase})
 
@@ -2634,6 +2637,17 @@ ${result.result}
 The overall time budget (${getOptions(options).overallTimeoutMs}ms) is spent, so
 retrying now would fail the same way. Raise \`overallTimeoutMs\`, reduce the
 task scope, or answer without orchestration.`
+          }
+          if (phaseTimedOut) {
+            return `## Orchestration Failed (${error.phase})
+
+**Error:** ${error.message}
+
+**Recoverable:** no
+
+The "${error.phase}" phase already used its own retries before timing out.
+Retrying would spend another full run reaching the same slow step. Raise
+\`phaseTimeoutMs\`, check provider latency, or simplify the task.`
           }
           return `## Orchestration Failed (${error.phase})
 
