@@ -2619,6 +2619,22 @@ ${result.result}
           errorPhase: error instanceof OrchestrationError ? error.phase : undefined,
         })
         if (error instanceof OrchestrationError) {
+          // An exhausted overall budget is not transient: telling the caller
+          // "recoverable, please try again" makes orchestrating agents burn
+          // the same full budget again in a retry loop.
+          const budgetExhausted =
+            !orchestratorContext.abort.aborted && /^Operation aborted during /.test(error.message)
+          if (budgetExhausted) {
+            return `## Orchestration Failed (${error.phase})
+
+**Error:** ${error.message}
+
+**Recoverable:** no
+
+The overall time budget (${getOptions(options).overallTimeoutMs}ms) is spent, so
+retrying now would fail the same way. Raise \`overallTimeoutMs\`, reduce the
+task scope, or answer without orchestration.`
+          }
           return `## Orchestration Failed (${error.phase})
 
 **Error:** ${error.message}
