@@ -147,6 +147,8 @@ telemetry(action="cleanup")    # Clean old sessions
 
 Metrics include: total orchestrations, success/failure rates, average execution time, strategy usage, and per-phase timing breakdowns.
 
+These metrics are **local and in-memory** (never exported, no network calls). This plugin intentionally does not ship an OTLP/OpenTelemetry pipeline — export observability through a dedicated plugin such as `opencode-otel-plugin`, which already traces the `orchestrate` tool call via the standard `tool.execute.*` hooks. The two do not compete: different sinks, different data (phase-level internals here, cross-plugin traces/metrics there). The optional `enablePersistentTelemetry` file (off by default) is the only thing written to disk. For a single pane of glass, bridge these counters into your OTLP metrics rather than duplicating collection.
+
 ## Configuration
 
 Configure the plugin via `opencode.json`. Options are passed as the second element of the plugin tuple:
