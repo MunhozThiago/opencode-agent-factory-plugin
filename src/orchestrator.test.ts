@@ -6,6 +6,8 @@ import {
   validateAgentSpecs,
   normalizeAgentSpecs,
   generateAgentSpecs,
+  recordOtelBridge,
+  resetOtelBridge,
   validateExecutionResult,
   validateConsensusResult,
   validateInput,
@@ -20,6 +22,7 @@ import {
   OrchestrationError,
 } from "./orchestrator"
 import { makeSpec, createMockClient, makeContext } from "./mock-client"
+import { metrics as otelMetrics } from "@opentelemetry/api"
 
 // ============================================================
 // extractJson
@@ -803,5 +806,59 @@ describe("generateOrchestrationDiagram", () => {
     expect(levelOf("c")).toContain("← b")
     // three distinct levels means two separator arrows
     expect((agentMap.match(/↓/g) ?? []).length).toBe(2)
+  })
+})
+
+describe("recordOtelBridge", () => {
+  const captured: Array<{ name: string; value: number; attrs: Record<string, unknown> }> = []
+
+  test("is a safe no-op that never throws", async () => {
+    await expect(
+      recordOtelBridge({
+        ok: true,
+        path: "fast-path",
+        strategy: "single",
+        agents: 2,
+        totalMs: 1234,
+        phaseTimings: { "fast-path": 300, execute: 700, review: 100, synthesize: 134 },
+      })
+    ).resolves.toBeUndefined()
+    await expect(
+      recordOtelBridge({ ok: false, path: "unknown", strategy: "auto", agents: 0, totalMs: 42, errorPhase: "plan" })
+    ).resolves.toBeUndefined()
+  })
+
+  test("publishes counts and phase timings to a registered MeterProvider", async () => {
+    const fakeMeter = {
+      createCounter: (name: string) => ({
+        add: (value: number, attrs: Record<string, unknown>) => captured.push({ name, value, attrs }),
+      }),
+      createHistogram: (name: string) => ({
+        record: (value: number, attrs: Record<string, unknown>) => captured.push({ name, value, attrs }),
+      }),
+    }
+    ;(otelMetrics as any).setGlobalMeterProvider({ getMeter: () => fakeMeter })
+    resetOtelBridge()
+    captured.length = 0
+
+    await recordOtelBridge({
+      ok: true,
+      path: "complex",
+      strategy: "debate",
+      agents: 3,
+      totalMs: 2500,
+      phaseTimings: { analyze: 400, plan: 600, execute: 1000, review: 300, synthesize: 200 },
+    })
+
+    const count = captured.find(c => c.name === "orchestration.count")
+    expect(count).toBeDefined()
+    expect(count!.value).toBe(1)
+    expect(count!.attrs).toMatchObject({ status: "ok", path: "complex", strategy: "debate" })
+    expect(captured.some(c => c.name === "orchestration.duration" && c.value === 2500)).toBe(true)
+    expect(captured.some(c => c.name === "orchestration.agents" && c.value === 3)).toBe(true)
+
+    const phases = captured.filter(c => c.name === "orchestration.phase.duration")
+    expect(phases).toHaveLength(5)
+    expect(phases.some(p => p.attrs.phase === "review" && p.value === 300)).toBe(true)
   })
 })

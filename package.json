@@ -12,7 +12,7 @@
     }
   },
   "scripts": {
-    "build": "bun build src/index.ts --outdir dist --target bun && tsc -p tsconfig.types.json",
+    "build": "bun build src/index.ts --outdir dist --target bun --external:@opentelemetry/api && tsc -p tsconfig.types.json",
     "typecheck": "tsc --noEmit",
     "test": "bun test",
     "prepublishOnly": "bun run build"
@@ -55,5 +55,8 @@
     "name": "Agent Factory",
     "description": "Dynamic multi-agent orchestration with runtime agent generation and consensus protocols",
     "minVersion": "0.1.0"
+  },
+  "dependencies": {
+    "@opentelemetry/api": "^1.9.1"
   }
 }

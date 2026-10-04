@@ -9,6 +9,7 @@ const __dirname = dirname(__filename)
 
 const DEFAULT_OVERALL_TIMEOUT_MS = 5 * 60 * 1000 // 5 minutes
 const DEFAULT_PHASE_TIMEOUT_MS = 2 * 60 * 1000 // 2 minutes
+const CLEANUP_DEADLINE_MS = 10_000 // never stall the tool return on session cleanup
 const MAX_PROMPT_LENGTH = 50000
 const VALID_STRATEGIES = ["auto", "single", "debate", "voting", "expert_review", "hierarchical"] as const
 
@@ -615,18 +616,40 @@ async function withPhase<T>(
 ): Promise<T> {
   checkAbort(outerSignal, phase)
   const { signal, dispose } = createTimeoutSignal(timeoutMs, outerSignal)
-  try {
-    return await fn(signal)
-  } catch (error) {
-    if (signal.aborted && !outerSignal.aborted) {
-      throw new OrchestrationError(
-        `Phase "${phase}" exceeded phase timeout of ${timeoutMs}ms`,
-        phase,
-        error instanceof Error ? error : undefined,
-        true
-      )
+  const deadlineError = (): OrchestrationError =>
+    outerSignal.aborted
+      ? new OrchestrationError(`Operation aborted during ${phase}`, phase, undefined, true)
+      : new OrchestrationError(
+          `Phase "${phase}" exceeded phase timeout of ${timeoutMs}ms`,
+          phase,
+          undefined,
+          true
+        )
+  // A phase callee may await network calls that never observe our signal, so
+  // racing the deadline here is the only way to guarantee a hung model call
+  // can never outlive its phase timeout or the overall run timeout.
+  const deadline = new Promise<never>((_, reject) => {
+    if (signal.aborted) {
+      reject(deadlineError())
+      return
     }
-    throw error
+    signal.addEventListener("abort", () => reject(deadlineError()), { once: true })
+  })
+  try {
+    return await Promise.race([
+      fn(signal).catch((error: unknown) => {
+        if (signal.aborted && !outerSignal.aborted) {
+          throw new OrchestrationError(
+            `Phase "${phase}" exceeded phase timeout of ${timeoutMs}ms`,
+            phase,
+            error instanceof Error ? error : undefined,
+            true
+          )
+        }
+        throw error
+      }),
+      deadline,
+    ])
   } finally {
     dispose()
   }
@@ -1220,8 +1243,19 @@ async function deleteSession(context: OrchestratorContext, sessionId: string): P
 
 async function cleanupSessions(context: OrchestratorContext): Promise<void> {
   // Performance: parallel cleanup instead of sequential
-  await Promise.all(context.createdSessions.map(id => deleteSession(context, id)))
+  const pending = Promise.all(context.createdSessions.map(id => deleteSession(context, id)))
   context.createdSessions = []
+  // Hard-bounded: a hung session.delete call must not prevent the tool from
+  // returning its result (or its failure report) to the caller.
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const deadline = new Promise<void>(resolve => {
+    timer = setTimeout(resolve, CLEANUP_DEADLINE_MS)
+  })
+  try {
+    await Promise.race([pending, deadline])
+  } finally {
+    clearTimeout(timer)
+  }
 }
 
 function buildAgentPrompt(agent: AgentSpec, userTask: string, dependencyOutputs: Record<string, string>): string {
@@ -2405,6 +2439,96 @@ function generateOrchestrationDiagram(
   return lines.join("\n")
 }
 
+// ---- OpenTelemetry bridge --------------------------------------------------
+// Publishes orchestration metrics into whatever global MeterProvider the host
+// registered (e.g. opencode-otel-plugin via `metrics.setGlobalMeterProvider`).
+// Degrades to a silent no-op when @opentelemetry/api or a provider is absent,
+// so telemetry can never break a run and the plugin never hard-requires otel.
+const OTEL_METER_NAME = "opencode.agent-factory"
+const OTEL_METRIC_PREFIX = typeof process !== "undefined" && process.env?.OPENCODE_OTEL_METRIC_PREFIX
+  ? process.env.OPENCODE_OTEL_METRIC_PREFIX
+  : ""
+
+interface BridgeInstruments {
+  count: { add(value: number, attrs?: Record<string, unknown>): void } | null
+  duration: { record(value: number, attrs?: Record<string, unknown>): void } | null
+  agents: { add(value: number, attrs?: Record<string, unknown>): void } | null
+  phaseDuration: { record(value: number, attrs?: Record<string, unknown>): void } | null
+}
+
+let bridgeMeter: any | null | undefined
+let bridgeInstruments: BridgeInstruments | null | undefined
+
+async function getBridgeMeter(): Promise<any | null> {
+  if (bridgeMeter !== undefined) return bridgeMeter
+  try {
+    const api = await import("@opentelemetry/api")
+    bridgeMeter = api?.metrics?.getMeter?.(OTEL_METER_NAME) ?? null
+  } catch {
+    bridgeMeter = null
+  }
+  return bridgeMeter
+}
+
+async function getBridgeInstruments(): Promise<BridgeInstruments | null> {
+  if (bridgeInstruments !== undefined) return bridgeInstruments
+  const meter = await getBridgeMeter()
+  if (!meter || typeof meter.createCounter !== "function") {
+    bridgeInstruments = null
+    return null
+  }
+  const n = (base: string) => (OTEL_METRIC_PREFIX ? `${OTEL_METRIC_PREFIX}${base}` : base)
+  try {
+    bridgeInstruments = {
+      count: meter.createCounter(n("orchestration.count"), { description: "Orchestration runs", unit: "invocations" }),
+      duration: meter.createHistogram(n("orchestration.duration"), { description: "Total orchestration time", unit: "ms" }),
+      agents: meter.createCounter(n("orchestration.agents"), { description: "Agents spawned per orchestration", unit: "agents" }),
+      phaseDuration: meter.createHistogram(n("orchestration.phase.duration"), { description: "Per-phase orchestration time", unit: "ms" }),
+    }
+  } catch {
+    bridgeInstruments = null
+  }
+  return bridgeInstruments
+}
+
+export interface OrchestrationBridgeEvent {
+  ok: boolean
+  path: "fast-path" | "complex" | "unknown"
+  strategy: string
+  agents: number
+  totalMs: number
+  phaseTimings?: Record<string, number>
+  errorPhase?: string
+}
+
+// Fire-and-forget: called from the orchestrate tool after every run.
+export async function recordOtelBridge(event: OrchestrationBridgeEvent): Promise<void> {
+  try {
+    const instruments = await getBridgeInstruments()
+    if (!instruments) return
+    const attrs = {
+      status: event.ok ? "ok" : "error",
+      path: event.path,
+      strategy: event.strategy,
+      ...(event.errorPhase ? { error_phase: event.errorPhase } : {}),
+    }
+    instruments.count?.add(1, attrs)
+    instruments.duration?.record(event.totalMs, attrs)
+    if (event.agents > 0) instruments.agents?.add(event.agents, { path: event.path })
+    for (const [phase, ms] of Object.entries(event.phaseTimings ?? {})) {
+      instruments.phaseDuration?.record(ms, { phase, path: event.path })
+    }
+  } catch {
+    // Telemetry must never break the run.
+  }
+}
+
+// Internal: drops the cached meter/instruments (exported for unit tests).
+export function resetOtelBridge(): void {
+  bridgeMeter = undefined
+  bridgeInstruments = undefined
+}
+
 export function getOrchestrateTool(client: any, project: any, directory: string, worktree: string, options?: PluginOptions) {
   // Initialize options with project directory
   const resolvedOptions = getOptions(options, directory)
@@ -2444,8 +2568,18 @@ export function getOrchestrateTool(client: any, project: any, directory: string,
         customTemplates,
       }
       
+      const orchestrateStart = Date.now()
       try {
         const result = await runOrchestration(orchestratorContext, args.prompt, args.strategy ?? "auto")
+
+        void recordOtelBridge({
+          ok: true,
+          path: result.metadata.phases_completed === 3 ? "fast-path" : "complex",
+          strategy: result.metadata.consensus_strategy,
+          agents: result.metadata.agents_spawned,
+          totalMs: result.metadata.total_time_ms,
+          phaseTimings: result.diagram.phaseTimings,
+        })
 
         // Generate visual diagram
         const diagram = generateOrchestrationDiagram(
@@ -2476,6 +2610,14 @@ ${result.result}
 - Total time: ${result.metadata.total_time_ms}ms`
       } catch (error) {
         await cleanupSessions(orchestratorContext)
+        void recordOtelBridge({
+          ok: false,
+          path: "unknown",
+          strategy: args.strategy ?? "auto",
+          agents: 0,
+          totalMs: Date.now() - orchestrateStart,
+          errorPhase: error instanceof OrchestrationError ? error.phase : undefined,
+        })
         if (error instanceof OrchestrationError) {
           return `## Orchestration Failed (${error.phase})
 

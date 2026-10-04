@@ -435,6 +435,39 @@ describe("runOrchestration: timeouts and aborts", () => {
     await delay(30)
     expect(disposed.signal.aborted).toBe(false)
   })
+
+  test("fails a hung phase call at the phase deadline", async () => {
+    const mock = createMockClient({
+      respond: pipelineResponder({ analysis: analysis(), specs: specs() }),
+      promptDelayMs: 3000,
+    })
+    const context = makeContext(mock.client, { phaseTimeoutMs: 150, overallTimeoutMs: 60000, maxRetries: 0 })
+
+    const started = Date.now()
+    const error = await runOrchestration(context, LONG_PROMPT, "auto").catch(e => e)
+    const elapsed = Date.now() - started
+
+    expect(error).toBeInstanceOf(OrchestrationError)
+    expect(error.message).toContain("phase timeout")
+    expect(error.phase).toBe("analyze")
+    expect(elapsed).toBeLessThan(1500)
+  })
+
+  test("fails a hung phase call at the overall deadline", async () => {
+    const mock = createMockClient({
+      respond: pipelineResponder({ analysis: analysis(), specs: specs() }),
+      promptDelayMs: 3000,
+    })
+    const context = makeContext(mock.client, { overallTimeoutMs: 150, phaseTimeoutMs: 60000, maxRetries: 0 })
+
+    const started = Date.now()
+    const error = await runOrchestration(context, LONG_PROMPT, "auto").catch(e => e)
+    const elapsed = Date.now() - started
+
+    expect(error).toBeInstanceOf(Error)
+    expect(error.message).toMatch(/abort/i)
+    expect(elapsed).toBeLessThan(1500)
+  })
 })
 
 describe("getOrchestrateTool", () => {
@@ -483,5 +516,29 @@ describe("getOrchestrateTool", () => {
     await tool.execute({ prompt: LONG_PROMPT }, { abort: new AbortController().signal })
 
     expect(mock.state.logs.some(m => m.startsWith("[Progress]"))).toBe(true)
+  })
+
+  test("returns a failure report instead of hanging when a model call stalls", async () => {
+    const mock = createMockClient({
+      respond: pipelineResponder({ analysis: analysis(), specs: specs() }),
+      promptDelayMs: 1000,
+    })
+
+    const tool = getOrchestrateTool(mock.client, { id: "p1" }, process.cwd(), process.cwd(), {
+      phaseTimeoutMs: 200,
+      overallTimeoutMs: 60000,
+      maxRetries: 0,
+    })
+
+    const started = Date.now()
+    const output = (await tool.execute(
+      { prompt: LONG_PROMPT },
+      { abort: new AbortController().signal }
+    )) as string
+    const elapsed = Date.now() - started
+
+    expect(elapsed).toBeLessThan(900)
+    expect(output).toContain("## Orchestration Failed")
+    expect(output).toContain("phase timeout")
   })
 })
