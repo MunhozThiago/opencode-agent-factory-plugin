@@ -480,7 +480,7 @@ describe("getOrchestrateTool", () => {
     expect(typeof output).toBe("string")
     expect(output).toContain("# Orchestration Diagram")
     expect(output).toContain("## Task Analysis")
-    expect(output).toContain("## Result")
+    expect(output).toContain("## Execution Schematic & Diagram")
     expect(output).toContain("FINAL SYNTHESIZED RESULT")
     expect(output).toContain("## Execution Summary")
     expect(output).toContain("Agents spawned: 2")

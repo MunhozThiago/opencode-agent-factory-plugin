@@ -2855,13 +2855,13 @@ export function getOrchestrateTool(client: any, project: any, directory: string,
           result.metadata.total_time_ms
         )
 
-        return `${diagram}
+        return `${result.result}
 
 ---
 
-## Result
+## Execution Schematic & Diagram
 
-${result.result}
+${diagram}
 
 ## Execution Summary
 - Agents spawned: ${result.metadata.agents_spawned}
