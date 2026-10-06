@@ -194,6 +194,9 @@ Configure the plugin via `opencode.json`. Options are passed as the second eleme
 | `enableTemplateLibrary` | `true` | Load saved analysis/plan templates |
 | `templateDirs` | `[.agent-factory/templates]` | Additional directories to load templates from |
 | `childAgent` | `"build"` | Agent used for every child session. Set this if your `default_agent` is an orchestrator (children must not call `orchestrate` again) |
+| `enableSessionPool` | `true` | Maintain concurrent long-lived agent session pool across orchestration phases for fast multi-turn interaction |
+| `consensusRounds` | `2` (max 4) | Number of multi-turn debate rounds executed in Phase 4 when debate strategy is selected |
+| `maxDebateAgents` | `3` (max 12) | Maximum number of active participant sessions in multi-turn debate rounds |
 
 Invalid values (wrong type, out-of-range numbers, unknown strategy) fall back to the defaults above.
 

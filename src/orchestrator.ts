@@ -11,7 +11,7 @@ const DEFAULT_OVERALL_TIMEOUT_MS = 5 * 60 * 1000 // 5 minutes
 const DEFAULT_PHASE_TIMEOUT_MS = 2 * 60 * 1000 // 2 minutes
 const CLEANUP_DEADLINE_MS = 10_000 // never stall the tool return on session cleanup
 const MAX_PROMPT_LENGTH = 50000
-const VALID_STRATEGIES = ["auto", "single", "debate", "voting", "expert_review", "hierarchical"] as const
+const VALID_STRATEGIES = ["auto", "single", "debate", "voting", "expert_review", "hierarchical", "mesh", "fipa_contract_net"] as const
 
 // Valid OpenCode tool names.
 // `orchestrate` and `delegate` are deliberately absent: a generated child agent
@@ -41,6 +41,9 @@ interface AgentFactoryPluginOptions {
   enableTemplateLibrary: boolean
   templateDirs: string[]
   childAgent: string
+  enableSessionPool: boolean
+  consensusRounds: number
+  maxDebateAgents: number
 }
 
 function normalizeStrategy(value: unknown): typeof VALID_STRATEGIES[number] {
@@ -84,6 +87,13 @@ function getOptions(options?: PluginOptions, projectDir?: string): AgentFactoryP
     childAgent: typeof options?.childAgent === "string" && options.childAgent.trim().length > 0
       ? options.childAgent.trim()
       : "build",
+    // Reuse one child session per agent/reviewer across rounds and fix passes
+    // instead of creating a fresh session for every prompt.
+    enableSessionPool: boolOption(options?.enableSessionPool, true),
+    // Real multi-round consensus: each round every participant sees the
+    // peers' previous replies. 1 = the legacy single aggregation call.
+    consensusRounds: Math.min(Math.max(Math.floor(numOption(options?.consensusRounds, 2, 1)), 1), 4),
+    maxDebateAgents: Math.min(Math.max(Math.floor(numOption(options?.maxDebateAgents, 3, 1)), 1), 12),
   }
 }
 
@@ -588,6 +598,10 @@ interface OrchestratorContext {
   onProgress?: ProgressCallback
   options: AgentFactoryPluginOptions
   customTemplates?: Map<string, string>
+  /** Session id promises keyed by pool key (one entry per agent/reviewer per run). */
+  pool?: Map<string, Promise<string>>
+  /** Absolute ms timestamp of the overall budget; extra rounds stop before it. */
+  deadlineAt?: number
 }
 
 function createTimeoutSignal(timeoutMs: number, externalSignal?: AbortSignal): { signal: AbortSignal; dispose: () => void } {
@@ -767,7 +781,7 @@ function validateTaskAnalysis(analysis: any): analysis is TaskAnalysis {
     ["simple", "moderate", "complex"].includes(analysis.complexity) &&
     Array.isArray(analysis.domains) &&
     Array.isArray(analysis.capabilities) &&
-    ["single", "debate", "voting", "expert_review", "hierarchical"].includes(analysis.consensus_strategy) &&
+    ["single", "debate", "voting", "expert_review", "hierarchical", "mesh", "fipa_contract_net"].includes(analysis.consensus_strategy) &&
     Array.isArray(analysis.parallel_groups)
   )
 }
@@ -1241,6 +1255,46 @@ async function deleteSession(context: OrchestratorContext, sessionId: string): P
   }
 }
 
+// One child session per key (agent spec, reviewer, …). Rounds and fix
+// passes then talk to a session that already remembers its own work —
+// that is what makes multi-round debate real instead of a re-prompt
+// from scratch, and the run creates far fewer sessions.
+async function acquirePooledSession(
+  context: OrchestratorContext,
+  key: string,
+  title: string,
+  signal: AbortSignal,
+): Promise<string> {
+  if (!context.options.enableSessionPool) {
+    return createChildSession(context, title, signal).then(session => session.id)
+  }
+  if (!context.pool) context.pool = new Map()
+  const hit = context.pool.get(key)
+  if (hit) return hit
+  const created = createChildSession(context, title, signal)
+    .then(session => session.id)
+    .catch(error => {
+      context.pool?.delete(key)
+      throw error
+    })
+  context.pool.set(key, created)
+  return created
+}
+
+async function pooledPrompt(
+  context: OrchestratorContext,
+  key: string,
+  title: string,
+  systemPrompt: string,
+  userPrompt: string,
+  tools?: Record<string, boolean>,
+  signal?: AbortSignal,
+) {
+  const active = signal ?? context.abort
+  const sessionId = await acquirePooledSession(context, key, title, active)
+  return promptSession(context, sessionId, systemPrompt, userPrompt, tools, active)
+}
+
 async function cleanupSessions(context: OrchestratorContext): Promise<void> {
   // Performance: parallel cleanup instead of sequential
   const pending = Promise.all(context.createdSessions.map(id => deleteSession(context, id)))
@@ -1423,15 +1477,11 @@ async function runNativeDAGExecution(
       metadata: { groupId, groupIndex, totalGroups, agentsInGroup: groupAgents.length }
     })
 
-    // Performance: create all sessions in parallel first, then prompt in parallel
-    const sessions = await Promise.all(
-      groupAgents.map(spec => createChildSession(context, `agent:${spec.id}:${spec.role}`, signal))
-    )
-    
-    // Spawn all agents in this group in parallel
+    // Performance: prompt each agent directly — with the pool this creates
+    // one session per agent and reuses it on fix passes; without the pool
+    // each call creates its own session, exactly as before.
     const groupPromises = groupAgents.map(async (spec, agentIndex) => {
       const agentStartTime = Date.now()
-      const session = sessions[agentIndex]
       
       try {
         checkAbort(signal, `agent-${spec.id}`)
@@ -1450,10 +1500,11 @@ async function runNativeDAGExecution(
           toolsObj[tool] = true
         }
         
-        const response = await promptSession(
+        const response = await pooledPrompt(
           context, 
-          session.id, 
-          spec.prompt, 
+          `agent:${spec.id}`,
+          `agent:${spec.id}:${spec.role}`,
+          spec.prompt,
           agentPrompt,
           toolsObj,
           signal
@@ -1535,17 +1586,178 @@ async function runPhase3Execute(context: OrchestratorContext, specs: AgentSpec[]
   return runNativeDAGExecution(context, specs, userTask, signal)
 }
 
-async function runPhase4Consensus(context: OrchestratorContext, executionResult: ExecutionResult, strategy: string, signal: AbortSignal): Promise<ConsensusResult> {
-  const child = await createChildSession(context, "consensus-manager:consensus", signal)
-  const consensusPrompt = getAgentPrompt("consensus-manager", context.customTemplates)
-  const systemPrompt = `${consensusPrompt}
+// Picks a bounded set of completed agents for consensus rounds.
+function debateParticipants(specs: AgentSpec[] | undefined, execution: ExecutionResult, max: number): AgentSpec[] {
+  if (!specs) return []
+  return specs.filter(s =>
+    execution.results[s.id]?.status === "completed" && execution.results[s.id].output.length > 0
+  ).slice(0, max)
+}
 
+function guidanceFor(strategy: string): string {
+  switch (strategy) {
+    case "voting":
+      return "State your recommendation clearly and change your mind only with a concrete reason."
+    case "expert_review":
+      return "Assess the team's work against expert standards; name the weakest deliverable and why."
+    case "hierarchical":
+      return "Recommend which direction the team should adopt and what to drop."
+    case "mesh":
+      return "Peer-to-peer collaboration: build directly upon your peers' partial outputs. Propose integrations or corrections."
+    case "fipa_contract_net":
+      return "FIPA Contract Net: evaluate the Call For Proposals (CFP). Propose your capability or state your refusal clearly."
+    default:
+      return "Defend, revise, or refine your position in light of the peers' inputs."
+  }
+}
+
+// Runs real multi-round consensus: each round every participant sees the
+// peers' replies from the previous round and can revise its position.
+async function runPhase4Consensus(
+  context: OrchestratorContext,
+  executionResult: ExecutionResult,
+  strategy: string,
+  signal: AbortSignal,
+  specs: AgentSpec[],
+  userTask: string,
+): Promise<ConsensusResult> {
+  const wanted = context.options.consensusRounds
+  const transcript: Array<{ round: number; replies: { agent: string; text: string }[] }> = []
+  const participants = debateParticipants(specs, executionResult, context.options.maxDebateAgents)
+
+  // Run real rounds only when budget allows and there are enough participants.
+  if (wanted >= 2 && participants.length >= 2) {
+    let budgetOk = true
+    if (context.deadlineAt) {
+      const reserve = context.options.phaseTimeoutMs          // leave room for aggregation + synthesis
+      const expectedRound = Math.ceil(context.options.phaseTimeoutMs / 2)
+      budgetOk = Date.now() + expectedRound + reserve <= context.deadlineAt
+    }
+    if (!budgetOk) {
+      emitProgress(context, {
+        phase: "consensus",
+        step: "rounds-skipped",
+        progress: 80,
+        message: `Skipping ${wanted} consensus rounds — not enough budget remaining; aggregating with current outputs`,
+        metadata: { budgetReason: "deadline" }
+      })
+    } else {
+      let convergedEarly = false
+      try {
+        await withPhase(context, signal, "consensus-rounds", async phaseSignal => {
+          for (let r = 1; r <= wanted && !convergedEarly; r++) {
+            // Budget check before each round.
+            if (context.deadlineAt) {
+              const reserve = context.options.phaseTimeoutMs
+              const expectedRound = Math.ceil(context.options.phaseTimeoutMs / 2)
+              if (Date.now() + expectedRound + reserve > context.deadlineAt) break
+            }
+            emitProgress(context, {
+              phase: "consensus",
+              step: "round-start",
+              progress: 76,
+              message: `Consensus round ${r} of ${wanted} (${participants.length} agents)`,
+              metadata: { round: r, maxRounds: wanted, participants: participants.length }
+            })
+            const replies = await Promise.all(participants.map(async (spec) => {
+              const sessionId = await acquirePooledSession(context, `agent:${spec.id}`, `agent:${spec.id}:${spec.role}`, phaseSignal)
+              const previousRound = transcript.length === 0
+                ? ""
+                : `PREVIOUS-ROUND DISCUSSION:\n${transcript.slice(-1).map(t => `ROUND ${t.round}:\n${t.replies.map(x => `  [${x.agent}]: ${x.text}`).join("\n")}`).join("\n")}`
+              const roundPrompt = `CONSENSUS ROUND ${r} of ${wanted} — ${strategy} consensus.\n
+YOUR ROLE: ${spec.role} — ${spec.goal}
+
+ORIGINAL TASK:
+${userTask}
+
+YOUR TEAM DELIVERABLE (already produced):
+### ${spec.id}: ${executionResult.results[spec.id]?.output || "(no output)"}
+
+${previousRound}
+
+${guidanceFor(strategy)}
+
+End your reply with exactly one line: CONVERGED: YES if you agree with the emerging direction, otherwise CONVERGED: NO.`
+              const response = await promptSession(context, sessionId, spec.prompt, roundPrompt, undefined, phaseSignal)
+              const text = response.parts.find((p: any) => p.type === "text")?.text ?? ""
+              return { agent: spec.id, text }
+            }))
+            transcript.push({ round: r, replies })
+            if (replies.every(r => r.text.includes("CONVERGED: YES"))) {
+              convergedEarly = true
+            }
+            emitProgress(context, {
+              phase: "consensus",
+              step: "round-complete",
+              progress: 80,
+              message: `Round ${r} complete (${replies.length} reply(ies))`,
+              metadata: { round: r, replies: replies.length }
+            })
+          }
+        })
+      } catch (err) {
+        if (signal.aborted || context.abort.aborted) throw err
+        emitProgress(context, {
+          phase: "consensus",
+          step: "rounds-failed",
+          progress: 80,
+          message: `Consensus rounds failed (${(err as Error).message}); aggregating with execution outputs`,
+          metadata: { error: (err as Error).message }
+        })
+      }
+    }
+  }
+
+  // Aggregation (always): the consensus-manager session parses a ConsensusResult.
+  try {
+    const sessionId = await acquirePooledSession(context, "consensus-manager", "consensus-manager:consensus", signal)
+    const consensusPrompt = getAgentPrompt("consensus-manager", context.customTemplates)
+    const systemPrompt = `${consensusPrompt}
 You are in Phase 4: CONSENSUS. Apply the consensus strategy. Output ONLY the ConsensusResult JSON.`
+    const roundText = transcript.length > 0
+      ? `ROUNDS EXECUTED: ${transcript.length}\n${transcript.slice(0, 3).map(r => `ROUND ${r.round}:\n${r.replies.map(x => `  [${x.agent}]: ${x.text}`).join("\n")}`).join("\n")}`
+      : ""
+    const userPrompt = `Strategy: ${strategy}\nAgent outputs:\n${JSON.stringify(executionResult.results, null, 2)}\n${roundText}`
+    const response = await promptSession(context, sessionId, systemPrompt, userPrompt, undefined, signal)
+    const result = extractJson<ConsensusResult>(response.parts.find((p: any) => p.type === "text")?.text ?? "")
+    if (!result || !validateConsensusResult(result)) throw new OrchestrationError("Failed to parse or validate consensus result", "phase4-consensus")
+    if (transcript.length > 0) result.rounds_executed = transcript.length
+    return result
+  } catch (err) {
+    if (signal.aborted || context.abort.aborted) throw err
+    emitProgress(context, {
+      phase: "consensus",
+      step: "consensus-degraded",
+      progress: 85,
+      message: `Consensus failed (${(err as Error).message}); building a local consensus from execution outputs`,
+      metadata: { error: (err as Error).message }
+    })
+    return buildLocalConsensus(executionResult, strategy, transcript.length)
+  }
+}
 
-  const response = await promptSession(context, child.id, systemPrompt, `Strategy: ${strategy}\nAgent outputs:\n${JSON.stringify(executionResult.results, null, 2)}`, undefined, signal)
-  const result = extractJson<ConsensusResult>(response.parts.find((p: any) => p.type === "text")?.text ?? "")
-  if (!result || !validateConsensusResult(result)) throw new OrchestrationError("Failed to parse or validate consensus result", "phase4-consensus")
-  return result
+// Builds a local fallback consensus when the consensus-manager is unavailable.
+function buildLocalConsensus(executionResult: ExecutionResult, strategy: string, roundsExecuted: number): ConsensusResult {
+  const completed = Object.entries(executionResult.results)
+    .filter(([_, r]) => r.status === "completed" && r.output.length > 0)
+  const failed = executionResult.execution_metadata.failed
+  return {
+    consensus_reached: completed.length > 0,
+    final_output: completed.length > 0
+      ? completed.map(([id, r]) => `### ${id}:\n${r.output}`).join("\n\n---\n\n")
+      : "No agent produced output",
+    confidence: completed.length > 0
+      ? (failed === 0 ? 0.5 : 0.3)
+      : 0.1,
+    strategy_used: strategy,
+    rounds_executed: Math.max(roundsExecuted, 1),
+    agent_contributions: Object.fromEntries(
+      Object.entries(executionResult.results).map(([id, r]) => [
+        id, { weight: 1, accepted: r.status === "completed" && r.output.length > 0 }
+      ])
+    ),
+    metadata: { convergence_score: completed.length > 0 ? 0.4 : 0 },
+  }
 }
 
 async function runPhase5Synthesize(
@@ -1572,7 +1784,11 @@ You are in Phase 5: SYNTHESIZE. Compile the final response using the consensus o
     undefined,
     signal
   )
-  return response.parts.find((p: any) => p.type === "text")?.text ?? "No result produced"
+  const text = response.parts.find((p: any) => p.type === "text")?.text ?? ""
+  // A synthesizer that returns no text must not sink the run: the consensus
+  // output is already a usable final answer.
+  if (text.trim().length > 0) return text
+  return consensus.final_output || "No result produced"
 }
 
 interface ReviewOutcome {
@@ -1663,7 +1879,7 @@ async function runReviewLoop(
     let verdict: { approved: boolean; issues: Array<{ agent_id?: string; description: string }> } | null = null
     try {
       verdict = await withPhase(context, signal, "review", async (phaseSignal) => {
-        const child = await createChildSession(context, `reviewer:round-${rounds}`, phaseSignal)
+        const sessionId = await acquirePooledSession(context, "reviewer", `reviewer:round-${rounds}`, phaseSignal)
         const systemPrompt = `You are a strict but fair reviewer on a delivery team.
 Review the deliverables against the task: correctness, completeness, internal consistency, and every requested item being present.
 Output ONLY this JSON and nothing else: {"approved": boolean, "issues": [{"agent_id": string, "description": string}]}
@@ -1675,7 +1891,7 @@ DELIVERABLES:
 ${Object.entries(results)
   .map(([id, r]) => `### ${id} (${r.status})\n${(r.output || r.error || "").slice(0, 8000)}`)
   .join("\n\n")}`
-        const response = await promptSession(context, child.id, systemPrompt, userPrompt, undefined, phaseSignal)
+        const response = await promptSession(context, sessionId, systemPrompt, userPrompt, undefined, phaseSignal)
         const text = response.parts.find((p: any) => p.type === "text")?.text ?? ""
         const parsed = extractJson<{ approved?: unknown; issues?: unknown }>(text)
         if (!parsed || typeof parsed.approved !== "boolean") return null
@@ -1826,6 +2042,9 @@ export async function runOrchestration(context: OrchestratorContext, userPrompt:
     metadata: { totalPhases: useFastPath ? 1 : 5, sessionId, strategy: effectiveStrategy }
   })
 
+  // Persistent pool and deadline for multi-round consensus
+  context.deadlineAt = Date.now() + context.options.overallTimeoutMs
+  context.pool = new Map()
   try {
     // Fast path for simple/short tasks, full Phase 1-5 pipeline otherwise.
     const result = useFastPath
@@ -1956,14 +2175,27 @@ You are handling a SIMPLE task. Do NOT perform the task yourself: no file writes
   const consensus = buildSingleConsensus(specs, execution)
 
   const synthStart = Date.now()
-  const finalResult = await withPhase(context, signal, "synthesize", phaseSignal =>
-    runPhase5Synthesize(
-      context,
-      consensus,
-      execution,
-      phaseSignal,
-      review.approved ? undefined : review.issues.join("\n")
-    ))
+  let finalResult: string
+  try {
+    finalResult = await withPhase(context, signal, "synthesize", phaseSignal =>
+      runPhase5Synthesize(
+        context,
+        consensus,
+        execution,
+        phaseSignal,
+        review.approved ? undefined : review.issues.join("\n")
+      ))
+  } catch (err) {
+    if (signal.aborted || context.abort.aborted) throw err
+    emitProgress(context, {
+      phase: "synthesize",
+      step: "synthesize-degraded",
+      progress: 95,
+      message: `Synthesis failed (${(err as Error).message}); using consensus output directly`,
+      metadata: { error: (err as Error).message }
+    })
+    finalResult = consensus.final_output
+  }
   const synthMs = Date.now() - synthStart
   
   const totalTime = Date.now() - startTime
@@ -2135,6 +2367,22 @@ You are in Phase 2: PLAN. Generate agent specifications from the analysis. Do NO
     metadata: { agentCount: specs.length, roles: specs.map(s => s.role) }
   })
 
+  // Bootstrap / Warm-up Phase
+  emitProgress(context, {
+    phase: "bootstrap",
+    step: "warming-pool",
+    progress: 38,
+    message: "Bootstrapping session pool and verifying agent readiness",
+    metadata: { enabled: context.options.enableSessionPool }
+  })
+  if (context.options.enableSessionPool && context.pool) {
+    try {
+      await acquirePooledSession(context, "bootstrap-probe", "bootstrap:probe", signal)
+    } catch {
+      // non-fatal
+    }
+  }
+
   // Phase 3: Execute (Native DAG)
   const phase3Start = Date.now()
   emitProgress(context, {
@@ -2200,7 +2448,7 @@ You are in Phase 2: PLAN. Generate agent specifications from the analysis. Do NO
     })
     
     consensus = await withPhase(context, signal, "consensus", phaseSignal =>
-      runPhase4Consensus(context, execution, finalStrategy, phaseSignal)
+      runPhase4Consensus(context, execution, finalStrategy, phaseSignal, specs, userPrompt)
     )
     
     emitProgress(context, {
@@ -2223,15 +2471,29 @@ You are in Phase 2: PLAN. Generate agent specifications from the analysis. Do NO
     metadata: {}
   })
   
-  const finalResult = await withPhase(context, signal, "synthesize", phaseSignal =>
-    runPhase5Synthesize(
-      context,
-      consensus,
-      execution,
-      phaseSignal,
-      reviewOutcome.review.approved ? undefined : reviewOutcome.review.issues.join("\n")
-    ))
-  phaseTimings["synthesize"] = Date.now() - phase5Start
+  const synthStart = Date.now()
+  let finalResult: string
+  try {
+    finalResult = await withPhase(context, signal, "synthesize", phaseSignal =>
+      runPhase5Synthesize(
+        context,
+        consensus,
+        execution,
+        phaseSignal,
+        reviewOutcome.review.approved ? undefined : reviewOutcome.review.issues.join("\n")
+      ))
+  } catch (err) {
+    if (signal.aborted || context.abort.aborted) throw err
+    emitProgress(context, {
+      phase: "synthesize",
+      step: "synthesize-degraded",
+      progress: 95,
+      message: `Synthesis failed (${(err as Error).message}); using consensus output directly`,
+      metadata: { error: (err as Error).message }
+    })
+    finalResult = consensus.final_output
+  }
+  phaseTimings["synthesize"] = Date.now() - synthStart
   
   const totalTime = Date.now() - startTime
 

@@ -24,6 +24,7 @@ export interface MockClientOptions {
 
 export interface MockClientState {
   created: string[]
+  createdTitles: string[]
   deleted: string[]
   prompts: RecordedPrompt[]
   logs: string[]
@@ -37,6 +38,7 @@ export function delay(ms: number): Promise<void> {
 export function createMockClient(options: MockClientOptions = {}) {
   const state: MockClientState = {
     created: [],
+    createdTitles: [],
     deleted: [],
     prompts: [],
     logs: [],
@@ -56,6 +58,7 @@ export function createMockClient(options: MockClientOptions = {}) {
         if (options.failCreate) return { data: null, error: "session create failed" }
         const id = `session-${++nextId}`
         state.created.push(id)
+        state.createdTitles.push(args?.body?.title ?? "untitled")
         state.openSessions.add(id)
         return { data: { id, title: args?.body?.title ?? "untitled" }, error: null }
       },
