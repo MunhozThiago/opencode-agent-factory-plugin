@@ -23,7 +23,7 @@
   "devDependencies": {
     "@opencode-ai/plugin": "latest",
     "bun-types": "latest",
-    "typescript": "^5.0.0"
+    "typescript": "^5.9.3"
   },
   "files": [
     "dist",
