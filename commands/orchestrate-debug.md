@@ -11,4 +11,4 @@ You MUST now call the `orchestrate` tool with the user's task as the `prompt` ar
 
 orchestrate(prompt: "$ARGUMENTS")
 
-Return the tool's result directly to the user.
+Return the result AND format/display the full orchestration diagram (agent map, execution flow, consensus stats, and phase timings) returned in the tool output so the user can inspect the debugging logs.
