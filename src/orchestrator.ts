@@ -1485,7 +1485,14 @@ async function runNativeDAGExecution(
       
       try {
         checkAbort(signal, `agent-${spec.id}`)
-        
+        emitProgress(context, {
+          phase: "execute",
+          step: `agent-${spec.id}-start`,
+          progress: groupProgressBase,
+          message: `▶ ${spec.id} (${spec.role}) started`,
+          metadata: { agent: spec.id, role: spec.role, groupId }
+        })
+
         const depOutputs: Record<string, string> = {}
         for (const depId of spec.depends_on) {
           if (completedOutputs[depId]) {
@@ -1515,6 +1522,13 @@ async function runNativeDAGExecution(
         
         completedOutputs[spec.id] = output
         completed++
+        emitProgress(context, {
+          phase: "execute",
+          step: `agent-${spec.id}-complete`,
+          progress: groupProgressBase,
+          message: `✔ ${spec.id} (${spec.role}) finished in ${durationMs}ms`,
+          metadata: { agent: spec.id, role: spec.role, durationMs, groupId }
+        })
         
         return {
           id: spec.id,
@@ -1528,6 +1542,13 @@ async function runNativeDAGExecution(
       } catch (error) {
         const durationMs = Date.now() - agentStartTime
         failed++
+        emitProgress(context, {
+          phase: "execute",
+          step: `agent-${spec.id}-failed`,
+          progress: groupProgressBase,
+          message: `✖ ${spec.id} (${spec.role}) failed: ${error instanceof Error ? error.message : String(error)}`,
+          metadata: { agent: spec.id, role: spec.role, durationMs, groupId }
+        })
         
         return {
           id: spec.id,
@@ -2853,7 +2874,7 @@ export function getOrchestrateTool(client: any, project: any, directory: string,
         )
       ),
     },
-    async execute(args: { prompt: string; strategy?: string }, context: { abort: AbortSignal }) {
+    async execute(args: { prompt: string; strategy?: string }, context: { abort: AbortSignal; metadata?: (input: { title?: string; metadata?: Record<string, unknown> }) => void }) {
       const orchestratorContext: OrchestratorContext = {
         client,
         project,
@@ -2863,6 +2884,18 @@ export function getOrchestrateTool(client: any, project: any, directory: string,
         createdSessions: [],
         options: resolvedOptions,
         customTemplates,
+        // Surface live phase/agent feedback in the TUI (like the task tool's
+        // streaming status) so the user sees progress instead of waiting blind.
+        onProgress: (event) => {
+          try {
+            context.metadata?.({
+              title: `${event.phase}: ${event.step}`,
+              metadata: { progress: event.progress, message: event.message, ...event.metadata },
+            })
+          } catch {
+            // metadata updates must never break the run
+          }
+        },
       }
       
       const orchestrateStart = Date.now()
