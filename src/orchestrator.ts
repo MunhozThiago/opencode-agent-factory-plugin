@@ -2528,6 +2528,35 @@ You are in Phase 2: PLAN. Generate agent specifications from the analysis. Do NO
   }
 }
 
+function generateProposedSchematic(analysis: TaskAnalysis | null, specs: AgentSpec[], strategy: string): string {
+  const lines: string[] = []
+  lines.push("## Proposed Execution Blueprint & Sequence")
+  lines.push("")
+  lines.push("```text")
+  lines.push(`Strategy: ${strategy} | Task Type: ${analysis?.task_type ?? "coding"} | Complexity: ${analysis?.complexity ?? "complex"}`)
+  lines.push("─────────────────────────────────────────────────────────────")
+  lines.push("PROPOSED AGENT CARDS:")
+  for (const spec of specs) {
+    const deps = spec.depends_on.length > 0 ? ` (deps: ${spec.depends_on.join(", ")})` : " (root)"
+    lines.push(`  • [${spec.id}] ${spec.role}${deps}`)
+    lines.push(`    Goal: ${spec.goal}`)
+    lines.push(`    Tier: ${spec.model_tier} | Tools: ${spec.tools.join(", ")}`)
+  }
+  lines.push("")
+  lines.push("PROPOSED INTERACTION SEQUENCE:")
+  lines.push("  [Orchestrator] ──► [Bootstrap Pool Warm-up]")
+  for (const spec of specs) {
+    lines.push(`  [Orchestrator] ──► [${spec.id}: ${spec.role}] (Parallel DAG Wave)`)
+  }
+  if (strategy !== "single") {
+    lines.push(`  [Agents] ──────► [Phase 4 Consensus: ${strategy} (Multi-Round)]`)
+  }
+  lines.push("  [Consensus] ───► [Phase 5 Synthesize] ──► [Final Result]")
+  lines.push("─────────────────────────────────────────────────────────────")
+  lines.push("```")
+  return lines.join("\n")
+}
+
 // Generate visual orchestration diagram
 function generateOrchestrationDiagram(
   userPrompt: string,
@@ -2566,6 +2595,12 @@ function generateOrchestrationDiagram(
     lines.push(`Capabilities: ${analysis.capabilities.join(", ")}`)
     lines.push(`Strategy:    ${analysis.consensus_strategy}`)
     lines.push("```")
+    lines.push("")
+  }
+
+  // Proposed Execution Blueprint & Sequence
+  if (specs.length > 0) {
+    lines.push(generateProposedSchematic(analysis, specs, consensus?.strategy_used ?? analysis?.consensus_strategy ?? "auto"))
     lines.push("")
   }
   
