@@ -1010,6 +1010,35 @@ function abortableDelay(ms: number, signal: AbortSignal, phase: string): Promise
   })
 }
 
+// Local TaskAnalysis built without an LLM round-trip. Used when Phase 1
+// (analyze) blows its phase timeout on a slow provider, so the run degrades
+// to a prompt-derived analysis instead of failing outright. Parse failures
+// stay fatal — a model that cannot produce TaskAnalysis JSON would fail the
+// later phases the same way.
+function localAnalysis(task: string, strategyOverride: string): TaskAnalysis {
+  const explicit = strategyOverride !== "auto" ? strategyOverride : undefined
+  const complexity: TaskAnalysis["complexity"] =
+    task.length <= 120 ? "simple" : task.length <= 600 ? "moderate" : "complex"
+  // Prefer the override; otherwise pick something proportional to complexity.
+  const chosen =
+    explicit ??
+    (complexity === "simple"
+      ? "single"
+      : complexity === "moderate"
+        ? "voting"
+        : "debate")
+  return {
+    task_type: "coding",
+    complexity,
+    domains: ["general"],
+    capabilities: ["code_execution"],
+    consensus_strategy: (VALID_STRATEGIES as readonly string[]).includes(chosen) && chosen !== "auto"
+      ? chosen as TaskAnalysis["consensus_strategy"]
+      : "debate",
+    parallel_groups: [{ group_id: 1, independent: true, subtasks: [task.slice(0, 100)] }],
+  }
+}
+
 // Generates AgentSpec[] from a child session and repairs near-miss output.
 // Last-resort spec built locally (no LLM round-trip) when every planner
 // attempt failed: the run degrades to one agent covering the whole task
@@ -2281,17 +2310,38 @@ async function runComplexPath(
     metadata: { strategy }
   })
 
-  analysis = await withPhase(context, signal, "analyze", async (phaseSignal) => {
-    const child1 = await createChildSession(context, "agent-factory:analyze", phaseSignal)
-    const systemPrompt = `${factoryPrompt}
+  // Phase 1 must not sink the run when the provider is merely slow: on a
+  // phase timeout we build a local analysis and skip the LLM planner so the
+  // run still reaches execution. Parse failures and broken session creation
+  // stay fatal — later phases would fail the same way.
+  let analyzeDegraded = false
+  try {
+    analysis = await withPhase(context, signal, "analyze", async (phaseSignal) => {
+      const child1 = await createChildSession(context, "agent-factory:analyze", phaseSignal)
+      const systemPrompt = `${factoryPrompt}
 
 You are in Phase 1: ANALYZE. Analyze the task and output ONLY the TaskAnalysis JSON.`
 
-    const analysisResponse = await promptSession(context, child1.id, systemPrompt, `Task: ${userPrompt}\n\n${strategy !== "auto" ? `Strategy override: ${strategy}` : "Select the best strategy automatically."}`, undefined, phaseSignal)
-    const parsedAnalysis = extractJson<TaskAnalysis>(analysisResponse.parts.find((p: any) => p.type === "text")?.text ?? "")
-    if (!parsedAnalysis || !validateTaskAnalysis(parsedAnalysis)) throw new OrchestrationError("Failed to parse or validate task analysis", "phase1-analyze")
-    return parsedAnalysis
-  })
+      const analysisResponse = await promptSession(context, child1.id, systemPrompt, `Task: ${userPrompt}\n\n${strategy !== "auto" ? `Strategy override: ${strategy}` : "Select the best strategy automatically."}`, undefined, phaseSignal)
+      const parsedAnalysis = extractJson<TaskAnalysis>(analysisResponse.parts.find((p: any) => p.type === "text")?.text ?? "")
+      if (!parsedAnalysis || !validateTaskAnalysis(parsedAnalysis)) throw new OrchestrationError("Failed to parse or validate task analysis", "phase1-analyze")
+      return parsedAnalysis
+    })
+  } catch (analyzeError) {
+    if (signal.aborted || context.abort.aborted) throw analyzeError
+    const timedOut = analyzeError instanceof OrchestrationError && /exceeded phase timeout/.test(analyzeError.message)
+    if (!timedOut) throw analyzeError
+    const reason = analyzeError instanceof Error ? analyzeError.message : String(analyzeError)
+    emitProgress(context, {
+      phase: "analyze",
+      step: "analyze-degraded",
+      progress: 20,
+      message: `Analysis timed out (${reason}); using a local analysis so the run can continue`,
+      metadata: { error: reason }
+    })
+    analysis = localAnalysis(userPrompt, strategy)
+    analyzeDegraded = true
+  }
   phaseTimings["analyze"] = Date.now() - phase1Start
   
   // Build strategy reasoning
@@ -2348,7 +2398,18 @@ You are in Phase 2: PLAN. Generate agent specifications from the analysis. Do NO
       return plannedSpecs
     }, timeoutMs)
 
-  try {
+  if (analyzeDegraded) {
+    // Phase 1 already burned a full phase budget on a slow provider; do not
+    // spend another one planning. Build the spec locally so execution runs.
+    emitProgress(context, {
+      phase: "plan",
+      step: "plan-degraded",
+      progress: 30,
+      message: "Analysis timed out earlier; skipping the planner and using a local agent spec",
+      metadata: { reason: "analyze-degraded" }
+    })
+    specs = [soloAgentSpec(userPrompt, context.options.phaseTimeoutMs)]
+  } else try {
     specs = await runPlan(JSON.stringify(analysis, null, 2))
   } catch (planError) {
     if (signal.aborted || context.abort.aborted) throw planError
@@ -2870,11 +2931,22 @@ export function getOrchestrateTool(client: any, project: any, directory: string,
       prompt: tool.schema.string().describe("The task to orchestrate across multiple agents"),
       strategy: tool.schema.optional(
         tool.schema.string().describe(
-          "Consensus strategy: auto (default), single, debate, voting, expert_review, hierarchical"
+          "Consensus strategy: auto (default), single, debate, voting, expert_review, hierarchical, mesh, fipa_contract_net"
         )
       ),
     },
     async execute(args: { prompt: string; strategy?: string }, context: { abort: AbortSignal; metadata?: (input: { title?: string; metadata?: Record<string, unknown> }) => void }) {
+      // Commands/templates often append "strategy=debate" inside the prompt
+      // text rather than as a separate argument — honor it instead of
+      // silently burying it in the task description.
+      let { prompt, strategy } = args
+      if (!strategy) {
+        const match = prompt.match(/\bstrategy\s*=\s*([a-z_]+)/i)
+        if (match && (VALID_STRATEGIES as readonly string[]).includes(match[1])) {
+          strategy = match[1]
+          prompt = prompt.replace(match[0], "").replace(/\s*,\s*(?=$|[,.;])/g, "").trim()
+        }
+      }
       const orchestratorContext: OrchestratorContext = {
         client,
         project,
@@ -2900,7 +2972,7 @@ export function getOrchestrateTool(client: any, project: any, directory: string,
       
       const orchestrateStart = Date.now()
       try {
-        const result = await runOrchestration(orchestratorContext, args.prompt, args.strategy ?? "auto")
+        const result = await runOrchestration(orchestratorContext, prompt, strategy ?? "auto")
 
         void recordOtelBridge({
           ok: true,
@@ -2913,7 +2985,7 @@ export function getOrchestrateTool(client: any, project: any, directory: string,
 
         // Generate visual diagram
         const diagram = generateOrchestrationDiagram(
-          args.prompt,
+          prompt,
           result.diagram.analysis,
           result.diagram.specs,
           result.diagram.execution,
@@ -2943,7 +3015,7 @@ ${diagram}
         void recordOtelBridge({
           ok: false,
           path: "unknown",
-          strategy: args.strategy ?? "auto",
+          strategy: strategy ?? "auto",
           agents: 0,
           totalMs: Date.now() - orchestrateStart,
           errorPhase: error instanceof OrchestrationError ? error.phase : undefined,

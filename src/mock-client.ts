@@ -16,6 +16,12 @@ export interface MockClientOptions {
   createDelayMs?: number
   /** Artificial delay in session.prompt (used to trigger timeouts). */
   promptDelayMs?: number
+  /**
+   * Per-prompt delay override (milliseconds). Takes precedence over
+   * `promptDelayMs`, so a test can stall one phase — e.g. a slow analyze
+   * call — while later phases answer promptly.
+   */
+  promptDelay?: (prompt: RecordedPrompt, index: number) => number
   /** Make session.create fail with an SDK-style error. */
   failCreate?: boolean
   /** Make selected prompts fail with an SDK-style error (retried by the engine). */
@@ -70,7 +76,10 @@ export function createMockClient(options: MockClientOptions = {}) {
           tools: body?.tools,
           agent: body?.agent,
         }
-        if (options.promptDelayMs) await delay(options.promptDelayMs)
+        const delayMs = options.promptDelay
+          ? options.promptDelay(record, state.prompts.length)
+          : options.promptDelayMs ?? 0
+        if (delayMs > 0) await delay(delayMs)
         state.prompts.push(record)
         const index = state.prompts.length - 1
         if (options.failPrompt?.(record, index)) {

@@ -402,13 +402,15 @@ describe("runOrchestration: timeouts and aborts", () => {
   })
 
   test("fails a phase that exceeds phaseTimeoutMs with a phase-scoped error", async () => {
+    // An analyze timeout degrades (local analysis + local spec), so the
+    // phase-scoped timeout error now surfaces at execute instead.
     const mock = createMockClient({ respond: pipelineResponder({ analysis: analysis(), specs: specs() }), createDelayMs: 30 })
     const context = makeContext(mock.client, { phaseTimeoutMs: 1 })
 
     const error = await runOrchestration(context, LONG_PROMPT, "auto").catch(e => e)
 
     expect(error).toBeInstanceOf(OrchestrationError)
-    expect(error.phase).toBe("analyze")
+    expect(error.phase).toBe("execute")
     expect(error.message).toContain("phase timeout")
     expect(error.recoverable).toBe(true)
     expect(mock.state.deleted).toEqual(mock.state.created)
@@ -449,8 +451,31 @@ describe("runOrchestration: timeouts and aborts", () => {
 
     expect(error).toBeInstanceOf(OrchestrationError)
     expect(error.message).toContain("phase timeout")
-    expect(error.phase).toBe("analyze")
+    // The hung analyze call degrades to a local analysis + local spec, so the
+    // deadline error surfaces at execute (and still within the same budget).
+    expect(error.phase).toBe("execute")
     expect(elapsed).toBeLessThan(1500)
+  })
+
+  test("recovers from a slow analyze call instead of failing the run", async () => {
+    // Only Phase 1 stalls past its deadline; every later phase answers
+    // promptly, so the run must degrade and finish rather than throw.
+    const mock = createMockClient({
+      respond: pipelineResponder({ analysis: analysis(), specs: specs() }),
+      promptDelay: prompt => (prompt.system.includes("Phase 1: ANALYZE") ? 400 : 0),
+    })
+    const context = makeContext(mock.client, { phaseTimeoutMs: 100, overallTimeoutMs: 60000, maxRetries: 0 })
+    const steps: string[] = []
+    context.onProgress = event => steps.push(event.step)
+
+    const result = await runOrchestration(context, LONG_PROMPT, "auto")
+
+    expect(result.result).toBe("FINAL SYNTHESIZED RESULT")
+    expect(steps).toContain("analyze-degraded")
+    expect(steps).toContain("plan-degraded")
+    // The planner was skipped entirely — no second full phase budget is spent
+    // on a provider that just stalled.
+    expect(mock.state.prompts.some(p => p.system.includes("Phase 2: PLAN"))).toBe(false)
   })
 
   test("fails a hung phase call at the overall deadline", async () => {
@@ -560,7 +585,9 @@ describe("getOrchestrateTool", () => {
       { abort: new AbortController().signal }
     )) as string
 
-    expect(output).toContain("## Orchestration Failed (analyze)")
+    // analyze degrades on timeout, so the non-recoverable phase timeout lands
+    // on execute instead of killing the run at analysis.
+    expect(output).toContain("## Orchestration Failed (execute)")
     expect(output).toContain("exceeded phase timeout")
     expect(output).toContain("Recoverable:** no")
     expect(output).toContain("phaseTimeoutMs")
