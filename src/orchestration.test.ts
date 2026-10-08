@@ -478,6 +478,24 @@ describe("runOrchestration: timeouts and aborts", () => {
     expect(mock.state.prompts.some(p => p.system.includes("Phase 2: PLAN"))).toBe(false)
   })
 
+  test("keeps the agents that finished when the execute phase hits its deadline", async () => {
+    // Agent "a" answers immediately; agent "b" hangs past the phase deadline.
+    // The finished work must be salvaged and the run must go on.
+    const mock = createMockClient({
+      respond: pipelineResponder({ analysis: analysis(), specs: specs() }),
+      promptDelay: prompt => (prompt.system === "SYSTEM_PROMPT_FOR_b" ? 800 : 0),
+    })
+    const context = makeContext(mock.client, { phaseTimeoutMs: 250, overallTimeoutMs: 60000, maxRetries: 0 })
+    const steps: string[] = []
+    context.onProgress = event => steps.push(event.step)
+
+    const result = await runOrchestration(context, LONG_PROMPT, "auto")
+
+    expect(steps).toContain("execute-partial")
+    expect(result.result).toBe("FINAL SYNTHESIZED RESULT")
+    expect(result.diagram.execution!.results.a.status).toBe("completed")
+  })
+
   test("fails a hung phase call at the overall deadline", async () => {
     const mock = createMockClient({
       respond: pipelineResponder({ analysis: analysis(), specs: specs() }),
@@ -616,4 +634,30 @@ describe("getOrchestrateTool", () => {
     expect(output).toContain("overall time budget")
     expect(output).not.toContain("Please try again or simplify")
   })
+
+  test("returns the plan and diagram alongside a failure", async () => {
+    // A timed-out run must still show what it planned, so the user never sees
+    // a bare error with no agent cards and no schematic.
+    const mock = createMockClient({
+      respond: pipelineResponder({ analysis: analysis(), specs: specs() }),
+      promptDelayMs: 1000,
+    })
+
+    const tool = getOrchestrateTool(mock.client, { id: "p1" }, process.cwd(), process.cwd(), {
+      phaseTimeoutMs: 200,
+      overallTimeoutMs: 60000,
+      maxRetries: 0,
+    })
+
+    const output = (await tool.execute(
+      { prompt: LONG_PROMPT },
+      { abort: new AbortController().signal }
+    )) as string
+
+    expect(output).toContain("## Orchestration Failed")
+    expect(output).toContain("## Run Stopped Early")
+    expect(output).toContain("# Orchestration Diagram")
+    expect(output).toContain("PROPOSED AGENT CARDS:")
+  })
 })
+

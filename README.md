@@ -180,7 +180,7 @@ Configure the plugin via `opencode.json`. Options are passed as the second eleme
 | Option | Default | Description |
 |--------|---------|-------------|
 | `overallTimeoutMs` | `300000` (5min) | Max total orchestration time (hard deadline — enforced even if a model call never returns) |
-| `phaseTimeoutMs` | `120000` (2min) | Max time per phase (same hard enforcement; a stalled call is abandoned, not awaited) |
+| `phaseTimeoutMs` | `120000` (2min) | Max time per phase (same hard enforcement; a stalled call is abandoned, not awaited). Phase 3 (execute) gets **2×** this budget because it fans out to every agent in parallel, capped by `overallTimeoutMs` |
 | `maxRetries` | `2` | Retry count for failed phases/agents |
 | `baseRetryDelayMs` | `1000` | Base delay for exponential backoff |
 | `maxAgents` | `12` | Max agents spawned per run; extra specs and unresolvable `depends_on` refs are dropped instead of failing |
@@ -212,6 +212,16 @@ To override agent settings, add them to your `opencode.json`:
   }
 }
 ```
+
+### Failure Behavior & Degraded Runs
+
+A slow or flaky provider should cost you a partial answer, never a bare error:
+
+- **Failure output always carries the plan.** When a run stops early you still get `## Orchestration Failed`, a `## Run Stopped Early` summary, `PROPOSED AGENT CARDS`, and the full `# Orchestration Diagram` — never just an exception string.
+- **Phase timeouts degrade instead of aborting.** `analyze` falls back to local analysis and a local single-agent spec (the LLM planner is skipped); `execute` keeps every agent that already finished and continues to review/consensus/synthesis; `consensus` and `synthesize` fall back to their defaults.
+- **Execute gets `2 × phaseTimeoutMs`.** Execution fans out to N agents in parallel, so a budget sized for one call would kill the fan-out before any agent returns.
+- **Workers are straightforward.** The planner is told to emit direct-doer specs; debate/voting/consensus framing belongs to Phase 4, so sub-agents don't argue with each other.
+- **Sessions are pooled and long-lived within a run.** Each `agent:<id>` session is created once, reused across rounds and fix passes, and only deleted at cleanup — after any still-streaming prompt finishes.
 
 ## Consensus Strategies in Detail
 

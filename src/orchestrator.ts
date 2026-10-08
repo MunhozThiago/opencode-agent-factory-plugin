@@ -588,6 +588,18 @@ interface ConsensusResult {
   metadata: { convergence_score: number }
 }
 
+// Whatever a run produced before it stopped. Used to render the schematic
+// alongside a failure instead of returning a bare error with no context.
+interface RunDiagnostics {
+  analysis?: TaskAnalysis
+  specs?: AgentSpec[]
+  execution?: ExecutionResult
+  consensus?: ConsensusResult
+  phaseTimings?: Record<string, number>
+  strategyReasoning?: string
+  strategy?: string
+}
+
 interface OrchestratorContext {
   client: PluginInput["client"]
   project: PluginInput["project"]
@@ -602,6 +614,16 @@ interface OrchestratorContext {
   pool?: Map<string, Promise<string>>
   /** Absolute ms timestamp of the overall budget; extra rounds stop before it. */
   deadlineAt?: number
+  /**
+   * Live model prompts, mapped to the session they are streaming into.
+   * Cleanup must not delete a session while one of these is outstanding:
+   * that is what made OpenCode's SQLite layer throw FOREIGN KEY errors on
+   * `part`/`message` inserts and left orphaned LLM calls running after the
+   * run had already returned.
+   */
+  inFlight?: Map<Promise<unknown>, string>
+  /** Whatever the run learned before it failed — rendered with the error. */
+  partial?: RunDiagnostics
 }
 
 function createTimeoutSignal(timeoutMs: number, externalSignal?: AbortSignal): { signal: AbortSignal; dispose: () => void } {
@@ -1247,7 +1269,7 @@ const CHILD_TOOL_OVERRIDES: Record<string, boolean> = {
 async function promptSession(context: OrchestratorContext, sessionId: string, systemPrompt: string, userPrompt: string, tools?: Record<string, boolean>, signal?: AbortSignal) {
   const active = signal ?? context.abort
   checkAbort(active, "promptSession")
-  return withRetry(context, async () => {
+  const pending = withRetry(context, async () => {
     const response: any = await context.client.session.prompt({
       path: { id: sessionId },
       body: {
@@ -1271,6 +1293,13 @@ async function promptSession(context: OrchestratorContext, sessionId: string, sy
     checkAbort(active, "promptSession")
     return response.data
   }, "promptSession", active)
+  // Track the live call so cleanup never deletes a session that is still
+  // streaming (that is what triggered OpenCode's FOREIGN KEY failures).
+  const inFlight = (context.inFlight ??= new Map())
+  inFlight.set(pending, sessionId)
+  const settled = () => inFlight.delete(pending)
+  void pending.then(settled, settled)
+  return pending
 }
 
 async function deleteSession(context: OrchestratorContext, sessionId: string): Promise<void> {
@@ -1325,9 +1354,29 @@ async function pooledPrompt(
 }
 
 async function cleanupSessions(context: OrchestratorContext): Promise<void> {
-  // Performance: parallel cleanup instead of sequential
-  const pending = Promise.all(context.createdSessions.map(id => deleteSession(context, id)))
+  const ids = context.createdSessions
   context.createdSessions = []
+  const inFlight = context.inFlight
+
+  // Performance: parallel cleanup instead of sequential. A session that still
+  // has a prompt streaming is deleted once that prompt settles rather than
+  // underneath it — ripping it out mid-stream is what made the host's SQLite
+  // layer throw FOREIGN KEY errors on `part`/`message` inserts. The deferral
+  // is fire-and-forget so a hung prompt can never stall the tool's return.
+  const pending = Promise.all(
+    ids.map(async id => {
+      const live = inFlight
+        ? [...inFlight.entries()].filter(([, sid]) => sid === id).map(([promise]) => promise.catch(() => {}))
+        : []
+      if (live.length > 0) {
+        void Promise.all(live)
+          .catch(() => {})
+          .then(() => deleteSession(context, id))
+        return
+      }
+      await deleteSession(context, id)
+    })
+  )
   // Hard-bounded: a hung session.delete call must not prevent the tool from
   // returning its result (or its failure report) to the caller.
   let timer: ReturnType<typeof setTimeout> | undefined
@@ -1357,6 +1406,8 @@ coordination notes through your output instead of touching their files.`
     : ""
 
   return `${agent.prompt}${ownership}
+
+WORKING MODE: you are a straightforward worker. Do your subtask directly and hand back a finished artifact. Debate, voting and consensus happen later in a separate phase — do not argue with, rebut or persuade the other agents.
 
 ORIGINAL TASK:
 ${userTask}
@@ -1396,12 +1447,15 @@ function computeGroupLevels(specs: AgentSpec[]): Map<string, number> {
   return levels
 }
 
-// Native DAG Execution: spawn agents in parallel groups via SDK
+// Native DAG Execution: spawn agents in parallel groups via SDK.
+// `sink` mirrors results as soon as each agent settles, so a phase timeout
+// can still salvage whatever finished instead of discarding the whole run.
 async function runNativeDAGExecution(
   context: OrchestratorContext, 
   specs: AgentSpec[], 
   userTask: string, 
-  signal: AbortSignal
+  signal: AbortSignal,
+  sink?: Record<string, AgentExecutionResult>
 ): Promise<ExecutionResult> {
   const startTime = Date.now()
   
@@ -1551,6 +1605,7 @@ async function runNativeDAGExecution(
         
         completedOutputs[spec.id] = output
         completed++
+        if (sink) sink[spec.id] = { status: "completed", output, error: null, duration_ms: durationMs }
         emitProgress(context, {
           phase: "execute",
           step: `agent-${spec.id}-complete`,
@@ -1571,6 +1626,14 @@ async function runNativeDAGExecution(
       } catch (error) {
         const durationMs = Date.now() - agentStartTime
         failed++
+        if (sink) {
+          sink[spec.id] = {
+            status: "failed",
+            output: "",
+            error: error instanceof Error ? error.message : String(error),
+            duration_ms: durationMs,
+          }
+        }
         emitProgress(context, {
           phase: "execute",
           step: `agent-${spec.id}-failed`,
@@ -1632,8 +1695,28 @@ async function runNativeDAGExecution(
 }
 
 // REPLACED: Native DAG execution instead of LLM-based execution-engine
-async function runPhase3Execute(context: OrchestratorContext, specs: AgentSpec[], userTask: string, signal: AbortSignal): Promise<ExecutionResult> {
-  return runNativeDAGExecution(context, specs, userTask, signal)
+async function runPhase3Execute(context: OrchestratorContext, specs: AgentSpec[], userTask: string, signal: AbortSignal, sink?: Record<string, AgentExecutionResult>): Promise<ExecutionResult> {
+  return runNativeDAGExecution(context, specs, userTask, signal, sink)
+}
+
+// Builds an ExecutionResult from whatever agents settled before the phase
+// deadline fired, so a slow run degrades to a partial team instead of dying.
+function buildPartialExecution(
+  sink: Record<string, AgentExecutionResult>,
+  specs: AgentSpec[],
+): ExecutionResult {
+  const settled = Object.values(sink)
+  const completed = settled.filter(r => r.status === "completed" && r.output.length > 0).length
+  return {
+    results: { ...sink },
+    execution_metadata: {
+      total_groups: 1,
+      total_agents: specs.length,
+      completed,
+      failed: settled.length - completed,
+      total_time_ms: 0,
+    },
+  }
 }
 
 // Picks a bounded set of completed agents for consensus rounds.
@@ -2095,6 +2178,9 @@ export async function runOrchestration(context: OrchestratorContext, userPrompt:
   // Persistent pool and deadline for multi-round consensus
   context.deadlineAt = Date.now() + context.options.overallTimeoutMs
   context.pool = new Map()
+  // Filled in as phases complete, so a failure can still show the user what
+  // the run planned and how far it got instead of a bare error message.
+  context.partial = { strategy: effectiveStrategy }
   try {
     // Fast path for simple/short tasks, full Phase 1-5 pipeline otherwise.
     const result = useFastPath
@@ -2297,6 +2383,7 @@ async function runComplexPath(
   let specs: AgentSpec[]
   const phaseTimings: Record<string, number> = {}
   let strategyReasoning = ""
+  if (context.partial) context.partial.phaseTimings = phaseTimings
 
   const factoryPrompt = getAgentPrompt("agent-factory", context.customTemplates)
 
@@ -2343,6 +2430,7 @@ You are in Phase 1: ANALYZE. Analyze the task and output ONLY the TaskAnalysis J
     analyzeDegraded = true
   }
   phaseTimings["analyze"] = Date.now() - phase1Start
+  if (context.partial) context.partial.analysis = analysis
   
   // Build strategy reasoning
   strategyReasoning = `Strategy "${analysis.consensus_strategy}" selected because:
@@ -2350,6 +2438,7 @@ You are in Phase 1: ANALYZE. Analyze the task and output ONLY the TaskAnalysis J
 - Complexity: ${analysis.complexity}
 - Domains: ${analysis.domains.join(", ")}
 ${strategy !== "auto" ? `- User override: ${strategy}` : "- Auto-selected based on analysis"}`
+  if (context.partial) context.partial.strategyReasoning = strategyReasoning
   
   emitProgress(context, {
     phase: "analyze",
@@ -2373,7 +2462,12 @@ ${strategy !== "auto" ? `- User override: ${strategy}` : "- Auto-selected based 
 
   const planSystemPrompt = `${factoryPrompt}
 
-You are in Phase 2: PLAN. Generate agent specifications from the analysis. Do NOT perform any of the work yourself: no file writes, no shell commands. Output ONLY the JSON array.`
+You are in Phase 2: PLAN. Generate agent specifications from the analysis. Do NOT perform any of the work yourself: no file writes, no shell commands. Output ONLY the JSON array.
+
+RULES FOR THE SPECS:
+- Agents are straightforward workers: each one performs its own subtask directly and returns a finished work product.
+- The consensus strategy (debate, voting, expert_review, ...) is applied LATER, in Phase 4. Never express it in the specs: no pro/con pairs, no opposing "right vs left" agents, no roles whose job is to argue, rebut or persuade. The worker never debates; it produces.
+- Prefer 2-4 agents. Split further only when the subtasks are genuinely independent.`
 
   const runPlan = (planBrief: string, timeoutMs?: number) =>
     withPhase(context, signal, "plan", async (phaseSignal) => {
@@ -2440,6 +2534,7 @@ You are in Phase 2: PLAN. Generate agent specifications from the analysis. Do NO
     }
   }
   phaseTimings["plan"] = Date.now() - phase2Start
+  if (context.partial) context.partial.specs = specs
   
   emitProgress(context, {
     phase: "plan",
@@ -2475,10 +2570,38 @@ You are in Phase 2: PLAN. Generate agent specifications from the analysis. Do NO
     metadata: { agentCount: specs.length }
   })
   
-  let execution = await withPhase(context, signal, "execute", phaseSignal =>
-    runPhase3Execute(context, specs, userPrompt, phaseSignal)
-  )
+  // Phase 3: Execute (Native DAG). A phase deadline here must not throw away
+  // the agents that already finished — a slow provider makes partial teams
+  // the common case, and dropping them produced a bare failure with no
+  // diagram and no answer at all.
+  //
+  // The deadline also scales up: execution fans out to N agents in parallel
+  // and on a slow provider individual agents measured 200-300s, so a budget
+  // meant for a single call killed the whole phase before anything returned.
+  const remainingBudget = context.deadlineAt ? context.deadlineAt - Date.now() : Number.POSITIVE_INFINITY
+  const executeTimeoutMs = Math.max(1, Math.min(context.options.phaseTimeoutMs * 2, remainingBudget))
+  const settledAgents: Record<string, AgentExecutionResult> = {}
+  let execution: ExecutionResult
+  try {
+    execution = await withPhase(context, signal, "execute", phaseSignal =>
+      runPhase3Execute(context, specs, userPrompt, phaseSignal, settledAgents), executeTimeoutMs
+    )
+  } catch (executeError) {
+    if (signal.aborted || context.abort.aborted) throw executeError
+    const timedOut = executeError instanceof OrchestrationError && /exceeded phase timeout/.test(executeError.message)
+    const salvageable = Object.values(settledAgents).filter(r => r.status === "completed" && r.output.length > 0)
+    if (!timedOut || salvageable.length === 0) throw executeError
+    emitProgress(context, {
+      phase: "execute",
+      step: "execute-partial",
+      progress: 65,
+      message: `Execution deadline reached with ${salvageable.length}/${specs.length} agent(s) finished; continuing with the partial team`,
+      metadata: { finished: salvageable.length, planned: specs.length }
+    })
+    execution = buildPartialExecution(settledAgents, specs)
+  }
   phaseTimings["execute"] = Date.now() - phase3Start
+  if (context.partial) context.partial.execution = execution
   
   emitProgress(context, {
     phase: "execute",
@@ -2493,6 +2616,7 @@ You are in Phase 2: PLAN. Generate agent specifications from the analysis. Do NO
   const reviewStart = Date.now()
   const reviewOutcome = await runReviewLoop(context, signal, userPrompt, specs, execution)
   execution = reviewOutcome.execution
+  if (context.partial) context.partial.execution = execution
   if (reviewOutcome.review.rounds > 0) {
     phaseTimings["review"] = Date.now() - reviewStart
   }
@@ -2542,6 +2666,10 @@ You are in Phase 2: PLAN. Generate agent specifications from the analysis. Do NO
     })
   }
   phaseTimings["consensus"] = Date.now() - phase4Start
+  if (context.partial) {
+    context.partial.consensus = consensus
+    context.partial.strategy = finalStrategy
+  }
 
   // Phase 5: Synthesize
   const phase5Start = Date.now()
@@ -2637,6 +2765,51 @@ function generateProposedSchematic(analysis: TaskAnalysis | null, specs: AgentSp
   lines.push("─────────────────────────────────────────────────────────────")
   lines.push("```")
   return lines.join("\n")
+}
+
+// A run that stops early still owes the user the plan: the agent cards, the
+// sequence, and how far each phase got. Rendering the diagram with the error
+// is what keeps a timeout from looking like the tool did nothing at all.
+function renderFailureDiagnostics(
+  partial: RunDiagnostics | undefined,
+  userPrompt: string,
+  elapsedMs: number,
+): string {
+  if (!partial) return ""
+  const analysis = partial.analysis ?? null
+  const specs = partial.specs ?? []
+  const phaseTimings = partial.phaseTimings ?? {}
+  if (!analysis && specs.length === 0 && Object.keys(phaseTimings).length === 0) return ""
+
+  const execution = partial.execution ?? null
+  const finished = execution
+    ? `${execution.execution_metadata.completed}/${execution.execution_metadata.total_agents} agent(s)`
+    : "none"
+  const phases = Object.entries(phaseTimings)
+    .map(([phase, ms]) => `${phase} ${ms}ms`)
+    .join(", ")
+
+  const diagram = generateOrchestrationDiagram(
+    userPrompt,
+    analysis,
+    specs,
+    execution,
+    partial.consensus ?? null,
+    partial.strategyReasoning ?? "",
+    phaseTimings,
+    elapsedMs,
+  )
+
+  return `---
+
+## Run Stopped Early
+
+- Strategy: ${partial.strategy ?? "auto"}
+- Agents finished before stopping: ${finished}
+- Time spent: ${elapsedMs}ms
+- Phase timings: ${phases || "none completed"}
+
+${diagram}`
 }
 
 // Generate visual orchestration diagram
@@ -3020,6 +3193,15 @@ ${diagram}
           totalMs: Date.now() - orchestrateStart,
           errorPhase: error instanceof OrchestrationError ? error.phase : undefined,
         })
+        // A failure still owes the user the plan: agent cards, diagram and the
+        // phase timings collected before the run stopped, so an aborted run
+        // never looks like the tool did nothing at all.
+        const diagnostics = renderFailureDiagnostics(
+          orchestratorContext.partial,
+          prompt,
+          Date.now() - orchestrateStart,
+        )
+        let report: string
         if (error instanceof OrchestrationError) {
           // Time-budget failures are not transient: answering "recoverable,
           // please try again" makes orchestrating agents burn the same full
@@ -3030,7 +3212,7 @@ ${diagram}
             !externalAbort && /^Operation aborted during /.test(error.message)
           const phaseTimedOut = !externalAbort && /exceeded phase timeout/.test(error.message)
           if (budgetExhausted) {
-            return `## Orchestration Failed (${error.phase})
+            report = `## Orchestration Failed (${error.phase})
 
 **Error:** ${error.message}
 
@@ -3039,9 +3221,8 @@ ${diagram}
 The overall time budget (${getOptions(options).overallTimeoutMs}ms) is spent, so
 retrying now would fail the same way. Raise \`overallTimeoutMs\`, reduce the
 task scope, or answer without orchestration.`
-          }
-          if (phaseTimedOut) {
-            return `## Orchestration Failed (${error.phase})
+          } else if (phaseTimedOut) {
+            report = `## Orchestration Failed (${error.phase})
 
 **Error:** ${error.message}
 
@@ -3050,20 +3231,23 @@ task scope, or answer without orchestration.`
 The "${error.phase}" phase already used its own retries before timing out.
 Retrying would spend another full run reaching the same slow step. Raise
 \`phaseTimeoutMs\`, check provider latency, or simplify the task.`
-          }
-          return `## Orchestration Failed (${error.phase})
+          } else {
+            report = `## Orchestration Failed (${error.phase})
 
 **Error:** ${error.message}
 
 **Recoverable:** ${error.recoverable ? "yes" : "no"}
 
 Please try again or simplify your request.`
-        }
-        return `## Orchestration Failed
+          }
+        } else {
+          report = `## Orchestration Failed
 
 **Error:** ${error instanceof Error ? error.message : String(error)}
 
 Please try again or contact support.`
+        }
+        return diagnostics ? `${report}\n\n${diagnostics}` : report
       }
     }
   }
