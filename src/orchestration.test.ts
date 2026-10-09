@@ -11,6 +11,7 @@ import {
   validateAgentSpecs,
   OrchestrationError,
   forwardRunEvent,
+  tailReserveMs,
 } from "./orchestrator"
 import { createMockClient, makeContext, makeSpec, pipelineResponder, delay } from "./mock-client"
 
@@ -498,6 +499,32 @@ describe("runOrchestration: timeouts and aborts", () => {
     expect(steps).toContain("execute-partial")
     expect(result.result).toBe("FINAL SYNTHESIZED RESULT")
     expect(result.diagram.execution!.results.a.status).toBe("completed")
+  })
+
+  test("reserves a quarter of the run for consensus and synthesis", () => {
+    const big = makeContext(createMockClient().client, { overallTimeoutMs: 600000 })
+    expect(tailReserveMs(big)).toBe(150000)
+
+    const capped = makeContext(createMockClient().client, { overallTimeoutMs: 120000 })
+    expect(tailReserveMs(capped)).toBe(30000)
+
+    // Tiny budgets keep half their time instead of losing it to the floor.
+    const small = makeContext(createMockClient().client, { overallTimeoutMs: 8000 })
+    expect(tailReserveMs(small)).toBe(4000)
+  })
+
+  test("skips review when the remaining budget belongs to synthesis", async () => {
+    const mock = createMockClient({
+      respond: pipelineResponder({ analysis: analysis(), specs: specs() }),
+    })
+    const context = makeContext(mock.client, { overallTimeoutMs: 3000, phaseTimeoutMs: 3000, maxRetries: 0 })
+    const steps: string[] = []
+    context.onProgress = event => steps.push(event.step)
+
+    const result = await runOrchestration(context, LONG_PROMPT, "auto")
+
+    expect(steps).toContain("review-skipped")
+    expect(result.result).toBe("FINAL SYNTHESIZED RESULT")
   })
 
   test("fails a hung phase call at the overall deadline", async () => {

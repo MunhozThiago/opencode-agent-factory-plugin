@@ -86,6 +86,26 @@ Spec output that is close-but-not-quite (unknown model tier, wrapper objects ins
 
 Use `task` when a single, well-scoped chunk of work is enough. Use `orchestrate` when the deliverable has parts with dependencies, needs parallel agents plus a structured synthesis, or has to survive a slow provider without dying halfway.
 
+### Positioning: Orchestrated Multi-Agent, Not a Subagent Wrapper
+
+Agent Factory is an **orchestrated multi-agent system**. That claim rests on properties most "subagent" patterns do not have:
+
+- **Independent agents.** Each agent runs in its own session with its own system prompt, tool set, goal and output format — not one model role-playing several parts.
+- **Interaction, not just fan-out.** Every consensus participant receives its peers' previous-round replies and revises its position; rounds end with an explicit `CONVERGED: YES/NO` vote and stop early once everyone agrees.
+- **Explicit coordination protocols.** Strategy is a real mechanism — `voting` (collective decision), `expert_review` (delegated authority), `hierarchical` (org structure), `fipa_contract_net` (market-style task bidding) — not the parent model improvising a merge.
+- **Distributed, dependency-aware execution.** Independent agents genuinely run in parallel in dependency-ordered groups under per-phase deadlines.
+- **Persistent identity within a run.** Sessions are pooled, so an agent keeps its context across debate rounds and fix passes.
+- **Authority structure.** A reviewer can reject work and force a fixer agent to repair it before a consensus manager aggregates results with a confidence score.
+
+Honest limits — the claim is *orchestrated* multi-agent, not autonomous:
+
+- Communication is **brokered by the orchestrator** (hub-and-spoke). Agents do not address each other directly, and no agent spawns another agent.
+- The topology is fixed at plan time; there is **no mid-run re-planning**.
+- All children run the **same configured model**. `model_tier` (`powerful`/`balanced`/`fast`) is validated metadata today, not a heterogeneous model router.
+- Memory is **scoped to one run** — pooled sessions are cleaned up when it ends.
+
+Planned work to close those gaps (shared blackboard memory, agent-initiated subagents, tool-use-driven loops, goal re-review loopback, tier-based model routing) will extend this model without changing the orchestration contract.
+
 ## Agents
 
 ### dynamic-orchestrator (primary)
@@ -228,6 +248,7 @@ A slow or flaky provider should cost you a partial answer, never a bare error:
 - **Failure output always carries the plan.** When a run stops early you still get `## Orchestration Failed`, a `## Run Stopped Early` summary, `PROPOSED AGENT CARDS`, and the full `# Orchestration Diagram` — never just an exception string.
 - **Phase timeouts degrade instead of aborting.** `analyze` falls back to local analysis and a local single-agent spec (the LLM planner is skipped); `execute` keeps every agent that already finished and continues to review/consensus/synthesis; `consensus` and `synthesize` fall back to their defaults.
 - **Execute gets `2 × phaseTimeoutMs`.** Execution fans out to N agents in parallel, so a budget sized for one call would kill the fan-out before any agent returns.
+- **The tail of the pipeline is protected.** Execute may spend only what remains *after* reserving 25% of the run (capped at half) for consensus and synthesis, and the review loop skips itself instead of squeezing the phase that produces the answer. A slow execute phase can no longer consume the whole budget and leave the run with no result.
 - **Workers are straightforward.** The planner is told to emit direct-doer specs; debate/voting/consensus framing belongs to Phase 4, so sub-agents don't argue with each other.
 - **Sessions are pooled and long-lived within a run.** Each `agent:<id>` session is created once, reused across rounds and fix passes, and only deleted at cleanup — after any still-streaming prompt finishes.
 

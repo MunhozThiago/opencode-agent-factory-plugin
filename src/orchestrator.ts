@@ -2127,6 +2127,18 @@ Return the corrected deliverable in full.`,
 // revise, and the cycle repeats up to maxReviewRounds times (like a team's
 // review -> fix -> re-review pass). Fails open when the reviewer is
 // unavailable or unparseable so review can never sink a good run.
+// Time that must still be available after execution finishes: consensus,
+// aggregation and synthesis are what turn agent output into an answer. Without
+// this reserve a slow execute phase consumed the entire budget and the run
+// died with nothing (observed live: a 600s budget spent ~510s inside execute
+// and then failed instead of synthesizing).
+export function tailReserveMs(context: OrchestratorContext): number {
+  const overall = context.options.overallTimeoutMs
+  // 25% of the run, clamped so tiny test budgets keep half their time and
+  // huge budgets do not reserve an absurd wall-clock block.
+  return Math.min(Math.max(Math.round(overall * 0.25), 15_000), Math.round(overall * 0.5))
+}
+
 async function runReviewLoop(
   context: OrchestratorContext,
   signal: AbortSignal,
@@ -2141,6 +2153,23 @@ async function runReviewLoop(
     return noop(execution, 0)
   }
 
+  // Review is the optional part of the tail: it may only spend what is left
+  // after the essential tail (consensus + synthesis) is already covered.
+  const budgetForOptionalWork = (): number => {
+    const left = context.deadlineAt ? context.deadlineAt - Date.now() : Number.POSITIVE_INFINITY
+    return left - tailReserveMs(context) - Math.min(context.options.phaseTimeoutMs, 60_000)
+  }
+  if (budgetForOptionalWork() < 0) {
+    emitProgress(context, {
+      phase: "review",
+      step: "review-skipped",
+      progress: 80,
+      message: "Skipping review: remaining budget is reserved for consensus and synthesis",
+      metadata: { deadlineAt: context.deadlineAt ?? null },
+    })
+    return noop(execution, 0)
+  }
+
   const results: Record<string, AgentExecutionResult> = { ...execution.results }
   const maxRounds = context.options.maxReviewRounds
   let approved = false
@@ -2148,6 +2177,18 @@ async function runReviewLoop(
   let openIssues: string[] = []
 
   for (let round = 0; round <= maxRounds; round++) {
+    // A fix round costs another full reviewer call; stop taking them once the
+    // essential tail would be squeezed.
+    if (round > 0 && budgetForOptionalWork() < 0) {
+      emitProgress(context, {
+        phase: "review",
+        step: "review-skipped",
+        progress: 80,
+        message: "Stopping review: remaining budget is reserved for synthesis",
+        metadata: { rounds },
+      })
+      return noop({ ...execution, results }, rounds)
+    }
     rounds = round + 1
     emitProgress(context, {
       phase: "review",
@@ -2729,8 +2770,15 @@ RULES FOR THE SPECS:
   // The deadline also scales up: execution fans out to N agents in parallel
   // and on a slow provider individual agents measured 200-300s, so a budget
   // meant for a single call killed the whole phase before anything returned.
+  // It is still capped by what is left *after* reserving the tail, so execute
+  // can never spend the consensus/synthesis budget and leave the run unable to
+  // produce an answer (live failure: 600s run, ~510s inside execute, no result).
   const remainingBudget = context.deadlineAt ? context.deadlineAt - Date.now() : Number.POSITIVE_INFINITY
-  const executeTimeoutMs = Math.max(1, Math.min(context.options.phaseTimeoutMs * 2, remainingBudget))
+  const spendableOnExecute =
+    remainingBudget === Number.POSITIVE_INFINITY
+      ? Number.POSITIVE_INFINITY
+      : Math.max(1, remainingBudget - tailReserveMs(context))
+  const executeTimeoutMs = Math.max(1, Math.min(context.options.phaseTimeoutMs * 2, spendableOnExecute))
   const settledAgents: Record<string, AgentExecutionResult> = {}
   let execution: ExecutionResult
   try {
