@@ -3,6 +3,7 @@ import { tool } from "@opencode-ai/plugin"
 import { readFileSync, existsSync, readdirSync, statSync, writeFileSync, mkdirSync } from "fs"
 import { join, dirname } from "path"
 import { fileURLToPath } from "url"
+import { RunBlackboard, parseBlackboardBlocks, BLACKBOARD_INSTRUCTION } from "./blackboard"
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = dirname(__filename)
@@ -44,6 +45,7 @@ interface AgentFactoryPluginOptions {
   enableSessionPool: boolean
   consensusRounds: number
   maxDebateAgents: number
+  enableBlackboard: boolean
 }
 
 function normalizeStrategy(value: unknown): typeof VALID_STRATEGIES[number] {
@@ -94,6 +96,10 @@ function getOptions(options?: PluginOptions, projectDir?: string): AgentFactoryP
     // peers' previous replies. 1 = the legacy single aggregation call.
     consensusRounds: Math.min(Math.max(Math.floor(numOption(options?.consensusRounds, 2, 1)), 1), 4),
     maxDebateAgents: Math.min(Math.max(Math.floor(numOption(options?.maxDebateAgents, 3, 1)), 1), 12),
+    // Run-scoped shared memory: agents post notes (finding/decision/issue/
+    // artifact) that every later agent is shown, so a team builds on prior
+    // work instead of rediscovering it.
+    enableBlackboard: boolOption(options?.enableBlackboard, true),
   }
 }
 
@@ -767,6 +773,8 @@ interface OrchestratorContext {
   parentSessionID?: string
   /** Child session id -> its title, used to attribute live server events. */
   sessionTitles?: Map<string, string>
+  /** Run-scoped shared memory between the agents of this run. */
+  blackboard?: RunBlackboard
 }
 
 function createTimeoutSignal(timeoutMs: number, externalSignal?: AbortSignal): { signal: AbortSignal; dispose: () => void } {
@@ -1538,10 +1546,20 @@ async function cleanupSessions(context: OrchestratorContext): Promise<void> {
   }
 }
 
-function buildAgentPrompt(agent: AgentSpec, userTask: string, dependencyOutputs: Record<string, string>): string {
+function buildAgentPrompt(
+  agent: AgentSpec,
+  userTask: string,
+  dependencyOutputs: Record<string, string>,
+  blackboard?: RunBlackboard,
+): string {
   const deps = Object.entries(dependencyOutputs)
     .map(([id, output]) => `${id}: ${output}`)
     .join("\n")
+
+  const notes = blackboard?.notesFor(agent.id) ?? ""
+  const sharedNotes = blackboard
+    ? `${notes ? `\n${notes}\n` : "\nSHARED NOTES FROM OTHER AGENTS IN THIS RUN: (none yet — you may be first)\n"}\n${BLACKBOARD_INSTRUCTION}\n`
+    : ""
 
   const ownership = agent.outputs && agent.outputs.length > 0
     ? `
@@ -1561,7 +1579,7 @@ ORIGINAL TASK:
 ${userTask}
 
 ${deps ? `DEPENDENCY OUTPUTS FROM PRIOR AGENTS:\n${deps}\n` : ""}
-
+${sharedNotes}
 YOUR SPECIFIC SUBTASK:
 ${agent.goal}
 
@@ -1731,7 +1749,7 @@ async function runNativeDAGExecution(
           }
         }
         
-        const agentPrompt = buildAgentPrompt(spec, userTask, depOutputs)
+        const agentPrompt = buildAgentPrompt(spec, userTask, depOutputs, context.blackboard)
         
         const toolsObj: Record<string, boolean> = {}
         for (const tool of spec.tools) {
@@ -1748,12 +1766,36 @@ async function runNativeDAGExecution(
           signal
         )
         
-        const output = response.parts.find((p: any) => p.type === "text")?.text ?? ""
+        const rawOutput = response.parts.find((p: any) => p.type === "text")?.text ?? ""
+        // Coordination notes are lifted out of the reply and posted to the
+        // run's shared blackboard; the deliverable stays clean of markers.
+        const { notes, rest: output } = context.blackboard
+          ? parseBlackboardBlocks(rawOutput)
+          : { notes: [] as Array<{ kind: any; content: string }>, rest: rawOutput }
         const durationMs = Date.now() - agentStartTime
-        
+
         completedOutputs[spec.id] = output
         completed++
         if (sink) sink[spec.id] = { status: "completed", output, error: null, duration_ms: durationMs }
+        if (context.blackboard && notes.length > 0) {
+          for (const note of notes) {
+            context.blackboard.record({
+              agentId: spec.id,
+              kind: note.kind,
+              content: note.content,
+              phase: "execute",
+            })
+          }
+          emitProgress(context, {
+            phase: "execute",
+            step: "blackboard-note",
+            progress: groupProgressBase,
+            message: `${spec.id} posted ${notes.length} note(s) to the shared blackboard: ${notes
+              .map(note => note.kind)
+              .join(", ")}`,
+            metadata: { agent: spec.id, kinds: notes.map(note => note.kind) },
+          })
+        }
         emitProgress(context, {
           phase: "execute",
           step: `agent-${spec.id}-complete`,
@@ -1774,11 +1816,22 @@ async function runNativeDAGExecution(
       } catch (error) {
         const durationMs = Date.now() - agentStartTime
         failed++
+        const failureText = error instanceof Error ? error.message : String(error)
+        if (context.blackboard) {
+          // A failure is knowledge too: later agents and the reviewer should
+          // not assume the missing work exists.
+          context.blackboard.record({
+            agentId: spec.id,
+            kind: "issue",
+            content: `agent ${spec.id} failed: ${failureText}`,
+            phase: "execute",
+          })
+        }
         if (sink) {
           sink[spec.id] = {
             status: "failed",
             output: "",
-            error: error instanceof Error ? error.message : String(error),
+            error: failureText,
             duration_ms: durationMs,
           }
         }
@@ -1786,7 +1839,7 @@ async function runNativeDAGExecution(
           phase: "execute",
           step: `agent-${spec.id}-failed`,
           progress: groupProgressBase,
-          message: `✖ ${spec.id} (${spec.role}) failed: ${error instanceof Error ? error.message : String(error)}`,
+          message: `✖ ${spec.id} (${spec.role}) failed: ${failureText}`,
           metadata: { agent: spec.id, role: spec.role, durationMs, groupId }
         })
         
@@ -2057,11 +2110,15 @@ You are in Phase 5: SYNTHESIZE. Compile the final response using the consensus o
   const note = reviewNote && reviewNote.length > 0
     ? `\n\nREVIEW NOTES - issues the reviewer did NOT consider resolved; call them out in the final answer:\n${reviewNote}`
     : ""
+  // Everything the team posted during the run travels with the synthesis, so
+  // findings from agents that never made it into consensus are not lost.
+  const sharedNotes = context.blackboard?.notesFor("synthesize") ?? ""
+  const board = sharedNotes ? `\n\nSHARED NOTES FROM THE AGENTS:\n${sharedNotes}` : ""
   const response = await promptSession(
     context,
     child.id,
     systemPrompt,
-    `Consensus result:\n${JSON.stringify(consensus, null, 2)}\n\nExecution metadata:\n${JSON.stringify(executionResult.execution_metadata, null, 2)}${note}`,
+    `Consensus result:\n${JSON.stringify(consensus, null, 2)}\n\nExecution metadata:\n${JSON.stringify(executionResult.execution_metadata, null, 2)}${note}${board}`,
     undefined,
     signal
   )
@@ -2282,6 +2339,19 @@ ${Object.entries(results)
       metadata: { round: rounds, issues: openIssues }
     })
 
+    // The reviewer's findings are shared knowledge too: post them so the fix
+    // pass and the synthesizer both see what was rejected and why.
+    if (context.blackboard) {
+      for (const issue of verdict.issues) {
+        context.blackboard.record({
+          agentId: "reviewer",
+          kind: "issue",
+          content: `${issue.agent_id ?? "unassigned"}: ${issue.description}`,
+          phase: "review",
+        })
+      }
+    }
+
     if (round === maxRounds) break
 
     const fixSpecs = buildFixSpecs(specs, verdict.issues, results)
@@ -2370,6 +2440,8 @@ export async function runOrchestration(context: OrchestratorContext, userPrompt:
   // Filled in as phases complete, so a failure can still show the user what
   // the run planned and how far it got instead of a bare error message.
   context.partial = { strategy: effectiveStrategy }
+  // Fresh run-scoped shared memory; agents post to it and later agents read it.
+  context.blackboard = context.options.enableBlackboard ? new RunBlackboard() : undefined
   // Live view of every child session while the run is in flight.
   const stopActivityWatcher = startChildActivityWatcher(context)
   try {
@@ -3281,6 +3353,22 @@ export function resetOtelBridge(): void {
 }
 
 const REPORT_RELATIVE_PATH = join(".agent-factory", "last-orchestration.md")
+const BLACKBOARD_RELATIVE_PATH = join(".agent-factory", "last-blackboard.md")
+
+// The run's shared memory is persisted next to the report so the notes agents
+// exchanged can be inspected after the sessions are cleaned up.
+function flushBlackboard(directory: string, board?: RunBlackboard): string | null {
+  const markdown = board?.renderMarkdown()
+  if (!markdown) return null
+  try {
+    const file = join(directory, BLACKBOARD_RELATIVE_PATH)
+    mkdirSync(dirname(file), { recursive: true })
+    writeFileSync(file, markdown, "utf-8")
+    return BLACKBOARD_RELATIVE_PATH
+  } catch {
+    return null
+  }
+}
 
 // The tool result is consumed by the model, which routinely paraphrases it and
 // drops the diagram (observed live: a full run whose reply contained none of the
@@ -3401,6 +3489,10 @@ export function getOrchestrateTool(client: any, project: any, directory: string,
           result.metadata.total_time_ms
         )
 
+        // Persist the shared memory of the run next to the report, so the
+        // notes the agents exchanged outlive the cleaned-up sessions.
+        const blackboardPath = flushBlackboard(directory, orchestratorContext.blackboard)
+
         const body = `${result.result}
 
 ---
@@ -3415,7 +3507,8 @@ ${diagram}
 - Consensus strategy: ${result.metadata.consensus_strategy}
 - Consensus reached: ${result.metadata.consensus_reached ? "yes" : "no"}
 - Confidence: ${(result.metadata.confidence * 100).toFixed(0)}%
-- Total time: ${result.metadata.total_time_ms}ms`
+- Total time: ${result.metadata.total_time_ms}ms${blackboardPath ? `
+- Shared blackboard: ${blackboardPath}` : ""}`
 
         const reportPath = writeOrchestrationReport(directory, body)
         const seconds = (result.metadata.total_time_ms / 1000).toFixed(1)
@@ -3498,7 +3591,13 @@ Please try again or simplify your request.`
 
 Please try again or contact support.`
         }
-        const fullReport = diagnostics ? `${report}\n\n${diagnostics}` : report
+        const blackboardPath = flushBlackboard(directory, orchestratorContext.blackboard)
+        const boardNote = blackboardPath
+          ? `\n\n**Shared blackboard:** notes posted before the run stopped: ${blackboardPath}`
+          : ""
+        const fullReport = diagnostics
+          ? `${report}${boardNote}\n\n${diagnostics}`
+          : `${report}${boardNote}`
         const failedReportPath = writeOrchestrationReport(directory, fullReport)
         showRunToast(orchestratorContext, {
           title: "Orchestrate failed",

@@ -96,15 +96,16 @@ Agent Factory is an **orchestrated multi-agent system**. That claim rests on pro
 - **Distributed, dependency-aware execution.** Independent agents genuinely run in parallel in dependency-ordered groups under per-phase deadlines.
 - **Persistent identity within a run.** Sessions are pooled, so an agent keeps its context across debate rounds and fix passes.
 - **Authority structure.** A reviewer can reject work and force a fixer agent to repair it before a consensus manager aggregates results with a confidence score.
+- **Shared memory across the team.** Every agent may post a note — a finding, decision, issue or artifact — to a run-scoped blackboard. Later agents are shown those notes, so the team builds on prior work instead of rediscovering it, and the whole board is flushed to `.agent-factory/last-blackboard.md`.
 
 Honest limits — the claim is *orchestrated* multi-agent, not autonomous:
 
 - Communication is **brokered by the orchestrator** (hub-and-spoke). Agents do not address each other directly, and no agent spawns another agent.
 - The topology is fixed at plan time; there is **no mid-run re-planning**.
 - All children run the **same configured model**. `model_tier` (`powerful`/`balanced`/`fast`) is validated metadata today, not a heterogeneous model router.
-- Memory is **scoped to one run** — pooled sessions are cleaned up when it ends.
+- Memory is **scoped to one run** — pooled sessions are cleaned up when it ends, and the shared blackboard is a run-scoped file rather than long-term memory.
 
-Planned work to close those gaps (shared blackboard memory, agent-initiated subagents, tool-use-driven loops, goal re-review loopback, tier-based model routing) will extend this model without changing the orchestration contract.
+Planned work to close those gaps (agent-initiated subagents, tool-use-driven loops, goal re-review loopback, tier-based model routing) will extend this model without changing the orchestration contract.
 
 ## Agents
 
@@ -225,6 +226,7 @@ Configure the plugin via `opencode.json`. Options are passed as the second eleme
 | `enableSessionPool` | `true` | Maintain concurrent long-lived agent session pool across orchestration phases for fast multi-turn interaction |
 | `consensusRounds` | `2` (max 4) | Number of multi-turn debate rounds executed in Phase 4 when debate strategy is selected |
 | `maxDebateAgents` | `3` (max 12) | Maximum number of active participant sessions in multi-turn debate rounds |
+| `enableBlackboard` | `true` | Run-scoped shared memory: agents post `<<<BLACKBOARD kind=finding>>>` notes that later agents and the synthesizer are shown |
 
 Invalid values (wrong type, out-of-range numbers, unknown strategy) fall back to the defaults above.
 
@@ -257,6 +259,7 @@ A slow or flaky provider should cost you a partial answer, never a bare error:
 A run is observable while it happens and inspectable afterwards, whether or not the model chooses to relay anything back:
 
 - **Full report on disk.** Every run — success or failure — is written to `.agent-factory/last-orchestration.md`, containing the answer, the `# Orchestration Diagram`, the proposed agent cards and the execution summary with phase timings.
+- **Shared blackboard on disk.** The notes the agents exchanged — findings, decisions, and the reviewer's rejected issues — are saved to `.agent-factory/last-blackboard.md`, and the report links to them.
 - **Toast on completion.** A `success` toast announces agents, strategy, duration and the report path; failures show an `error` toast pointing at the saved report.
 - **Lead line in the tool output.** The tool result starts with `**Orchestrate:** N agents · strategy · Xs · full report: …`, so whatever the model echoes back already names the run.
 - **Nested sub-agent sessions.** Child sessions are created with the calling session's `parentID`, so they appear as that session's sub-agents rather than as orphan sessions.

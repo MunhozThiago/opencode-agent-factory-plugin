@@ -833,3 +833,128 @@ describe("live sub-agent visibility", () => {
   })
 })
 
+describe("shared blackboard", () => {
+  const NOTE_AGENT_A = `Checked the schema. Use integer ids.
+
+<<<BLACKBOARD kind=finding>>>
+The id column must be an integer primary key.
+<<<END BLACKBOARD>>>`
+
+  test("shares an agent's note with later agents and the synthesizer", async () => {
+    const fallback = pipelineResponder({ analysis: analysis(), specs: specs() })
+    const mock = createMockClient({
+      respond: prompt => (prompt.system === "SYSTEM_PROMPT_FOR_a" ? NOTE_AGENT_A : fallback(prompt)),
+    })
+    const context = makeContext(mock.client)
+    const steps: string[] = []
+    context.onProgress = event => steps.push(event.step)
+
+    const result = await runOrchestration(context, LONG_PROMPT, "auto")
+
+    expect(result.result).toBe("FINAL SYNTHESIZED RESULT")
+    expect(steps).toContain("blackboard-note")
+
+    const bPrompt = mock.state.prompts.find(p => p.system === "SYSTEM_PROMPT_FOR_b")
+    expect(bPrompt).toBeDefined()
+    // The board is injected with instructions on how to post to it.
+    expect(bPrompt!.user).toContain("SHARED NOTES FROM OTHER AGENTS IN THIS RUN")
+    expect(bPrompt!.user).toContain("- [finding] a: The id column must be an integer primary key.")
+    expect(bPrompt!.user).toContain("<<<BLACKBOARD kind=finding>>>")
+    // What reaches b as a dependency output is the cleaned deliverable.
+    const depsBlock = bPrompt!.user.split("DEPENDENCY OUTPUTS FROM PRIOR AGENTS:")[1]?.split("\n\n")[0] ?? ""
+    expect(depsBlock).toContain("a: Checked the schema. Use integer ids.")
+    expect(depsBlock).not.toContain("<<<BLACKBOARD")
+
+    // The synthesizer gets the board too, so notes survive consensus.
+    const synth = mock.state.prompts.find(p => p.system.includes("Phase 5: SYNTHESIZE"))
+    expect(synth).toBeDefined()
+    expect(synth!.user).toContain("SHARED NOTES FROM THE AGENTS")
+    expect(synth!.user).toContain("integer primary key")
+
+    expect(context.blackboard!.size()).toBeGreaterThanOrEqual(1)
+  })
+
+  test("puts reviewer issues on the board for the synthesizer", async () => {
+    let reviewCalls = 0
+    const fallback = pipelineResponder({ analysis: analysis("single"), specs: specs() })
+    const mock = createMockClient({
+      respond: prompt => {
+        if (prompt.system.includes("You are a strict but fair reviewer")) {
+          reviewCalls += 1
+          return reviewCalls === 1
+            ? JSON.stringify({ approved: false, issues: [{ agent_id: "a", description: "edge cases missing" }] })
+            : JSON.stringify({ approved: true, issues: [] })
+        }
+        return fallback(prompt)
+      },
+    })
+    const context = makeContext(mock.client, { maxReviewRounds: 2 })
+
+    const result = await runOrchestration(context, LONG_PROMPT, "auto")
+
+    expect(result.result).toBe("FINAL SYNTHESIZED RESULT")
+    const entries = context.blackboard?.entries() ?? []
+    expect(
+      entries.some(entry => entry.agentId === "reviewer" && entry.kind === "issue" && entry.content.includes("edge cases missing")),
+    ).toBe(true)
+    const synth = mock.state.prompts.find(p => p.system.includes("Phase 5: SYNTHESIZE"))
+    expect(synth!.user).toContain("edge cases missing")
+  })
+
+  test("persists the shared blackboard next to the run report", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "af-blackboard-"))
+    try {
+      const fallback = pipelineResponder({ analysis: analysis("single"), specs: specs() })
+      const mock = createMockClient({
+        respond: prompt =>
+          prompt.system === "SYSTEM_PROMPT_FOR_a"
+            ? `done\n<<<BLACKBOARD kind=issue>>>\nblocked: no network access\n<<<END BLACKBOARD>>>`
+            : fallback(prompt),
+      })
+      const tool = getOrchestrateTool(mock.client, { id: "p1" }, dir, dir, {})
+
+      const output = (await tool.execute(
+        { prompt: LONG_PROMPT },
+        { abort: new AbortController().signal },
+      )) as string
+
+      const boardPath = join(dir, ".agent-factory", "last-blackboard.md")
+      expect(existsSync(boardPath)).toBe(true)
+      const saved = readFileSync(boardPath, "utf8")
+      expect(saved).toContain("# Shared Blackboard")
+      expect(saved).toContain("blocked: no network access")
+
+      expect(output).toContain("Shared blackboard:")
+      const report = readFileSync(join(dir, ".agent-factory", "last-orchestration.md"), "utf8")
+      expect(report).toContain("last-blackboard.md")
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("stays off when enableBlackboard is false", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "af-blackboard-off-"))
+    try {
+      const fallback = pipelineResponder({ analysis: analysis("single"), specs: specs() })
+      const mock = createMockClient({
+        respond: prompt =>
+          prompt.system === "SYSTEM_PROMPT_FOR_a"
+            ? `done\n<<<BLACKBOARD kind=finding>>>\nhidden note\n<<<END BLACKBOARD>>>`
+            : fallback(prompt),
+      })
+      const tool = getOrchestrateTool(mock.client, { id: "p1" }, dir, dir, { enableBlackboard: false })
+
+      await tool.execute({ prompt: LONG_PROMPT }, { abort: new AbortController().signal })
+
+      const bPrompt = mock.state.prompts.find(p => p.system === "SYSTEM_PROMPT_FOR_b")
+      expect(bPrompt!.user).not.toContain("SHARED NOTES FROM OTHER AGENTS")
+      // Nothing parses the markers, so they simply stay in the deliverable.
+      expect(bPrompt!.user).toContain("hidden note")
+      expect(bPrompt!.user).toContain("<<<BLACKBOARD kind=finding>>>")
+      expect(existsSync(join(dir, ".agent-factory", "last-blackboard.md"))).toBe(false)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+})
+
