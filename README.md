@@ -72,11 +72,19 @@ Spec output that is close-but-not-quite (unknown model tier, wrapper objects ins
 
 | Feature | Built-in `task` tool | Agent Factory Plugin |
 |---------|---------------------|---------------------|
-| Agent roles | Pre-defined, fixed | Generated per-task at runtime |
-| Parallel execution | Manual | Automatic DAG scheduling via SDK |
+| Decomposition | Model improvises: one prompt in, one message out | Fixed 5-phase pipeline: analyze → plan → execute → consensus → synthesize |
+| Agent roles | Pre-defined, fixed agents | Generated per task at runtime (role, goal, tools, model tier) |
+| Parallel execution | Model issues several calls by hand | Automatic DAG scheduling with dependency-ordered groups |
 | Dependencies | Manual tracking | Automatic injection between groups |
-| Consensus | None | 5 strategies (debate, voting, etc.) |
+| Retries & time budgets | None — a stalled call stalls the turn | Per-phase deadlines, retries with simplify-on-retry, overall budget, graceful degradation instead of a hard failure |
+| Consensus | Parent model merges results informally | 6 strategies, including multi-round debate, voting, expert review and hierarchical |
+| Session lifetime | Fresh session per task call | Pooled long-lived session per agent, reused across debate rounds and fix passes |
+| Visibility | One background task card | Nested child sessions, live per-agent activity, `# Orchestration Diagram`, `.agent-factory/last-orchestration.md`, completion toasts |
+| Failure behaviour | Error bubbles up to the model | Finished agents are salvaged and the plan + diagram are still returned |
+| Output | A single message | Structured report: answer, agent cards, diagram, phase timings, telemetry |
 | Model selection | Manual | Automatic tier assignment |
+
+Use `task` when a single, well-scoped chunk of work is enough. Use `orchestrate` when the deliverable has parts with dependencies, needs parallel agents plus a structured synthesis, or has to survive a slow provider without dying halfway.
 
 ## Agents
 
@@ -222,6 +230,16 @@ A slow or flaky provider should cost you a partial answer, never a bare error:
 - **Execute gets `2 × phaseTimeoutMs`.** Execution fans out to N agents in parallel, so a budget sized for one call would kill the fan-out before any agent returns.
 - **Workers are straightforward.** The planner is told to emit direct-doer specs; debate/voting/consensus framing belongs to Phase 4, so sub-agents don't argue with each other.
 - **Sessions are pooled and long-lived within a run.** Each `agent:<id>` session is created once, reused across rounds and fix passes, and only deleted at cleanup — after any still-streaming prompt finishes.
+
+### Inspecting a Run
+
+A run is observable while it happens and inspectable afterwards, whether or not the model chooses to relay anything back:
+
+- **Full report on disk.** Every run — success or failure — is written to `.agent-factory/last-orchestration.md`, containing the answer, the `# Orchestration Diagram`, the proposed agent cards and the execution summary with phase timings.
+- **Toast on completion.** A `success` toast announces agents, strategy, duration and the report path; failures show an `error` toast pointing at the saved report.
+- **Lead line in the tool output.** The tool result starts with `**Orchestrate:** N agents · strategy · Xs · full report: …`, so whatever the model echoes back already names the run.
+- **Nested sub-agent sessions.** Child sessions are created with the calling session's `parentID`, so they appear as that session's sub-agents rather than as orphan sessions.
+- **Live activity.** Server events for those children are forwarded into progress events — per-agent `tool bash (running)`, reasoning, text previews and `finished` — surfaced through tool metadata and `app.log` as `[Progress] agents: agent:<id> …`.
 
 ## Consensus Strategies in Detail
 

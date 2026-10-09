@@ -3,7 +3,7 @@ import { tool } from "@opencode-ai/plugin"
 import { 
   getOrchestrateTool, getTelemetrySnapshot, resetTelemetry, getSessionInfo, cleanupOldSessions,
   setGoal, getGoal, updateGoal, completeGoal, blockGoal, pauseGoal, resumeGoal, clearGoal,
-  incrementTurnCount, validateCompletion
+  incrementTurnCount, validateCompletion, forwardRunEvent
 } from "./orchestrator"
 
 export const AgentFactoryPlugin: Plugin = async ({ project, client, directory, worktree }, options) => {
@@ -205,6 +205,10 @@ ${Object.entries(snapshot.phaseTimings as Record<string, number[]>).map(([phase,
 
     // Event hooks for auto-continue and state tracking
     event: async ({ event }) => {
+      // Live sub-agent visibility: hand every server event to an active
+      // orchestration run so it can surface what each child session is doing.
+      forwardRunEvent(event)
+
       // Track idle events for auto-continue
       if (event.type === "session.idle") {
         const sessionId = event.properties.sessionID

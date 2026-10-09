@@ -435,6 +435,141 @@ function emitProgress(context: OrchestratorContext, event: ProgressEvent): void 
   }
 }
 
+// ============================================================================
+// LIVE SUB-AGENT VISIBILITY
+// ============================================================================
+// OpenCode forwards every server event to the plugin's `event` hook. While a
+// run is active the orchestrator registers a forwarder, so each child session's
+// tool calls, reasoning and text deltas are turned into progress events — the
+// same visibility the built-in task tool gives its background subagents.
+type RunEventForwarder = (event: any) => void
+
+const runEventForwarders = new Set<RunEventForwarder>()
+
+export function addRunEventForwarder(forwarder: RunEventForwarder): () => void {
+  runEventForwarders.add(forwarder)
+  return () => {
+    runEventForwarders.delete(forwarder)
+  }
+}
+
+/** Called by the plugin for every server event (see index.ts). */
+export function forwardRunEvent(event: any): void {
+  if (runEventForwarders.size === 0) return
+  for (const forwarder of [...runEventForwarders]) {
+    try {
+      forwarder(event)
+    } catch {
+      // Observation must never break the run it is observing.
+    }
+  }
+}
+
+/** Two activity lines per agent per second is plenty; nothing else floods. */
+const ACTIVITY_THROTTLE_MS = 500
+
+function activityFromPart(
+  part: any,
+  delta?: unknown,
+): { message: string; progress: number; kind: string } | null {
+  const streamed = typeof delta === "string" && delta.length > 0 ? delta : undefined
+  switch (part?.type) {
+    case "tool": {
+      const status = part.state?.status ? ` (${part.state.status})` : ""
+      return { kind: "tool", progress: 45, message: `tool ${part.tool ?? "unknown"}${status}` }
+    }
+    case "text": {
+      const sample = String(streamed ?? part.text ?? "").trim().replace(/\s+/g, " ")
+      if (!sample) return null
+      return { kind: "text", progress: 65, message: sample.slice(0, 96) }
+    }
+    case "reasoning":
+      return { kind: "reasoning", progress: 30, message: "thinking…" }
+    case "step-start":
+      return { kind: "step", progress: 20, message: "starting next step" }
+    case "step-finish":
+      return { kind: "step", progress: 90, message: "step complete" }
+    case "subtask":
+      return {
+        kind: "subtask",
+        progress: 25,
+        message: `subtask: ${String(part.description ?? part.prompt ?? "")}`.slice(0, 96),
+      }
+    default:
+      return null
+  }
+}
+
+function handleRunEvent(
+  context: OrchestratorContext,
+  event: any,
+  lastEmit: Map<string, number>,
+  highWater: Map<string, number>,
+): void {
+  if (!event || typeof event !== "object") return
+  const props = event.properties ?? {}
+  const sessionID =
+    event.type === "message.part.updated" ? props.part?.sessionID : props.sessionID
+  if (!sessionID) return
+  const title = context.sessionTitles?.get(sessionID)
+  if (!title) return // not a child session of this run
+
+  let message: string
+  let target: number
+  let kind: string
+  if (event.type === "message.part.updated") {
+    const derived = activityFromPart(props.part, props.delta)
+    if (!derived) return
+    ;({ message, progress: target, kind } = derived)
+  } else if (event.type === "session.status" && props.status?.type === "busy") {
+    message = "working"
+    kind = "status"
+    target = 15
+  } else if (event.type === "session.status" && props.status?.type === "retry") {
+    message = `retrying (attempt ${props.status.attempt ?? "?"})`
+    kind = "status"
+    target = 15
+  } else if (event.type === "session.idle") {
+    message = "finished"
+    kind = "status"
+    target = 100
+  } else {
+    return
+  }
+
+  const finished = target >= 100
+  const now = Date.now()
+  if (!finished && now - (lastEmit.get(sessionID) ?? 0) < ACTIVITY_THROTTLE_MS) return
+  lastEmit.set(sessionID, now)
+
+  // Progress only ever moves forward, so a late "starting next step" cannot
+  // walk the bar backwards after an agent already reported 90%.
+  const progress = Math.min(100, Math.max(highWater.get(sessionID) ?? 0, target))
+  highWater.set(sessionID, progress)
+
+  emitProgress(context, {
+    phase: "agents",
+    step: `agent:${title}`,
+    progress,
+    message,
+    metadata: { sessionId: sessionID, agent: title, kind },
+  })
+}
+
+/** Subscribe this run to live child-session activity; call the return value to stop. */
+function startChildActivityWatcher(context: OrchestratorContext): () => void {
+  if (context.options?.enableProgress === false) return () => {}
+  const lastEmit = new Map<string, number>()
+  const highWater = new Map<string, number>()
+  return addRunEventForwarder(event => {
+    try {
+      handleRunEvent(context, event, lastEmit, highWater)
+    } catch {
+      // never let the inspector take a run down
+    }
+  })
+}
+
 class OrchestrationError extends Error {
   constructor(
     message: string,
@@ -624,6 +759,14 @@ interface OrchestratorContext {
   inFlight?: Map<Promise<unknown>, string>
   /** Whatever the run learned before it failed — rendered with the error. */
   partial?: RunDiagnostics
+  /**
+   * Session that invoked `orchestrate`. Children are created with this as
+   * `parentID` so the TUI nests them under the calling session instead of
+   * leaving them as anonymous top-level sessions nobody can find.
+   */
+  parentSessionID?: string
+  /** Child session id -> its title, used to attribute live server events. */
+  sessionTitles?: Map<string, string>
 }
 
 function createTimeoutSignal(timeoutMs: number, externalSignal?: AbortSignal): { signal: AbortSignal; dispose: () => void } {
@@ -1217,6 +1360,9 @@ async function createChildSession(context: OrchestratorContext, title: string, s
       const created: any = await context.client.session.create({
         body: {
           title,
+          // Nest under the calling session: the TUI then lists these as the
+          // session's sub-agents instead of hiding them as orphan sessions.
+          ...(context.parentSessionID ? { parentID: context.parentSessionID } : {}),
         },
         query: { directory: context.directory },
       })
@@ -1256,6 +1402,8 @@ async function createChildSession(context: OrchestratorContext, title: string, s
   })
 
   context.createdSessions.push(session.id)
+  // Lets the activity watcher map a live server event back to this agent.
+  ;(context.sessionTitles ??= new Map()).set(session.id, title)
   return session
 }
 
@@ -2181,6 +2329,8 @@ export async function runOrchestration(context: OrchestratorContext, userPrompt:
   // Filled in as phases complete, so a failure can still show the user what
   // the run planned and how far it got instead of a bare error message.
   context.partial = { strategy: effectiveStrategy }
+  // Live view of every child session while the run is in flight.
+  const stopActivityWatcher = startChildActivityWatcher(context)
   try {
     // Fast path for simple/short tasks, full Phase 1-5 pipeline otherwise.
     const result = useFastPath
@@ -2204,6 +2354,7 @@ export async function runOrchestration(context: OrchestratorContext, userPrompt:
     recordTelemetry({ type: "orchestration_failed", durationMs: Date.now() - startTime })
     throw error
   } finally {
+    stopActivityWatcher()
     dispose()
     await cleanupSessions(context)
   }
@@ -3081,6 +3232,34 @@ export function resetOtelBridge(): void {
   bridgeInstruments = undefined
 }
 
+const REPORT_RELATIVE_PATH = join(".agent-factory", "last-orchestration.md")
+
+// The tool result is consumed by the model, which routinely paraphrases it and
+// drops the diagram (observed live: a full run whose reply contained none of the
+// agent cards, timings or schematic). The complete report is therefore also
+// written to disk and announced, so the run stays inspectable no matter what
+// the model chooses to relay back to the user.
+function writeOrchestrationReport(directory: string, content: string): string | null {
+  try {
+    const file = join(directory, REPORT_RELATIVE_PATH)
+    mkdirSync(dirname(file), { recursive: true })
+    writeFileSync(file, content, "utf-8")
+    return REPORT_RELATIVE_PATH
+  } catch {
+    return null
+  }
+}
+
+function showRunToast(
+  context: OrchestratorContext,
+  body: { title?: string; message: string; variant: "success" | "error" | "warning" | "info" },
+): void {
+  if (context.options?.enableProgress === false) return
+  const tui: any = (context.client as any)?.tui
+  if (typeof tui?.showToast !== "function") return
+  void Promise.resolve(tui.showToast({ body: { duration: 10000, ...body } })).catch(() => {})
+}
+
 export function getOrchestrateTool(client: any, project: any, directory: string, worktree: string, options?: PluginOptions) {
   // Initialize options with project directory
   const resolvedOptions = getOptions(options, directory)
@@ -3108,7 +3287,12 @@ export function getOrchestrateTool(client: any, project: any, directory: string,
         )
       ),
     },
-    async execute(args: { prompt: string; strategy?: string }, context: { abort: AbortSignal; metadata?: (input: { title?: string; metadata?: Record<string, unknown> }) => void }) {
+    async execute(
+      args: { prompt: string; strategy?: string },
+      // `sessionID` is what lets every child session nest under the caller, so
+      // the TUI shows them as this session's sub-agents instead of loose rows.
+      context: { sessionID?: string; abort: AbortSignal; metadata?: (input: { title?: string; metadata?: Record<string, unknown> }) => void },
+    ) {
       // Commands/templates often append "strategy=debate" inside the prompt
       // text rather than as a separate argument — honor it instead of
       // silently burying it in the task description.
@@ -3127,6 +3311,7 @@ export function getOrchestrateTool(client: any, project: any, directory: string,
         worktree,
         abort: context.abort,
         createdSessions: [],
+        parentSessionID: context.sessionID,
         options: resolvedOptions,
         customTemplates,
         // Surface live phase/agent feedback in the TUI (like the task tool's
@@ -3168,7 +3353,7 @@ export function getOrchestrateTool(client: any, project: any, directory: string,
           result.metadata.total_time_ms
         )
 
-        return `${result.result}
+        const body = `${result.result}
 
 ---
 
@@ -3183,6 +3368,24 @@ ${diagram}
 - Consensus reached: ${result.metadata.consensus_reached ? "yes" : "no"}
 - Confidence: ${(result.metadata.confidence * 100).toFixed(0)}%
 - Total time: ${result.metadata.total_time_ms}ms`
+
+        const reportPath = writeOrchestrationReport(directory, body)
+        const seconds = (result.metadata.total_time_ms / 1000).toFixed(1)
+        showRunToast(orchestratorContext, {
+          title: "Orchestrate",
+          variant: "success",
+          message: `${result.metadata.agents_spawned} agents · ${result.metadata.consensus_strategy} · ${seconds}s${
+            reportPath ? ` — full report: ${reportPath}` : ""
+          }`,
+        })
+
+        // Lead with the run stats: whatever the model relays back to the user,
+        // it starts from a line that already names the agents, strategy and time.
+        return `**Orchestrate:** ${result.metadata.agents_spawned} agents · ${
+          result.metadata.consensus_strategy
+        } · ${seconds}s${reportPath ? ` · full report: ${reportPath}` : ""}
+
+${body}`
       } catch (error) {
         await cleanupSessions(orchestratorContext)
         void recordOtelBridge({
@@ -3247,7 +3450,16 @@ Please try again or simplify your request.`
 
 Please try again or contact support.`
         }
-        return diagnostics ? `${report}\n\n${diagnostics}` : report
+        const fullReport = diagnostics ? `${report}\n\n${diagnostics}` : report
+        const failedReportPath = writeOrchestrationReport(directory, fullReport)
+        showRunToast(orchestratorContext, {
+          title: "Orchestrate failed",
+          variant: "error",
+          message: failedReportPath
+            ? `run stopped — full report: ${failedReportPath}`
+            : "run stopped before producing a result",
+        })
+        return fullReport
       }
     }
   }

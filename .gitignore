@@ -144,3 +144,6 @@ vite.config.ts.timestamp-*
 
 # opencode runtime state
 .opencode/
+
+# agent-factory run reports, telemetry and goal state
+.agent-factory/

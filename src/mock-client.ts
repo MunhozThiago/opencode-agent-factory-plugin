@@ -28,13 +28,29 @@ export interface MockClientOptions {
   failPrompt?: (prompt: RecordedPrompt, index: number) => boolean
 }
 
+export interface RecordedSession {
+  id: string
+  title: string
+  parentID?: string
+}
+
+export interface RecordedToast {
+  title?: string
+  message: string
+  variant?: string
+}
+
 export interface MockClientState {
   created: string[]
   createdTitles: string[]
+  /** Full record of every session.create, including the nesting parent. */
+  sessionRecords: RecordedSession[]
   deleted: string[]
   prompts: RecordedPrompt[]
   logs: string[]
   openSessions: Set<string>
+  /** TUI toasts the plugin asked OpenCode to show. */
+  toasts: RecordedToast[]
 }
 
 export function delay(ms: number): Promise<void> {
@@ -45,10 +61,12 @@ export function createMockClient(options: MockClientOptions = {}) {
   const state: MockClientState = {
     created: [],
     createdTitles: [],
+    sessionRecords: [],
     deleted: [],
     prompts: [],
     logs: [],
     openSessions: new Set(),
+    toasts: [],
   }
   let nextId = 0
 
@@ -58,15 +76,24 @@ export function createMockClient(options: MockClientOptions = {}) {
         state.logs.push(String(body?.message ?? ""))
       },
     },
+    tui: {
+      showToast: async ({ body }: { body?: RecordedToast }) => {
+        state.toasts.push(body ?? { message: "" })
+        return {}
+      },
+    },
     session: {
-      create: async (args?: { body?: { title?: string } }) => {
+      create: async (args?: { body?: { title?: string; parentID?: string } }) => {
         if (options.createDelayMs) await delay(options.createDelayMs)
         if (options.failCreate) return { data: null, error: "session create failed" }
         const id = `session-${++nextId}`
+        const title = args?.body?.title ?? "untitled"
+        const parentID = args?.body?.parentID
         state.created.push(id)
-        state.createdTitles.push(args?.body?.title ?? "untitled")
+        state.createdTitles.push(title)
+        state.sessionRecords.push({ id, title, parentID })
         state.openSessions.add(id)
-        return { data: { id, title: args?.body?.title ?? "untitled" }, error: null }
+        return { data: { id, title }, error: null }
       },
       prompt: async ({ path, body }: { path: { id: string }; body: any }) => {
         const record: RecordedPrompt = {

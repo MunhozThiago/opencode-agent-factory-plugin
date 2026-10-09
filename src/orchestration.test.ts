@@ -1,4 +1,7 @@
 import { expect, test, describe, beforeEach } from "bun:test"
+import { mkdtempSync, rmSync, existsSync, readFileSync } from "fs"
+import { tmpdir } from "os"
+import { join } from "path"
 import {
   runOrchestration,
   getOrchestrateTool,
@@ -7,6 +10,7 @@ import {
   createTimeoutSignal,
   validateAgentSpecs,
   OrchestrationError,
+  forwardRunEvent,
 } from "./orchestrator"
 import { createMockClient, makeContext, makeSpec, pipelineResponder, delay } from "./mock-client"
 
@@ -658,6 +662,147 @@ describe("getOrchestrateTool", () => {
     expect(output).toContain("## Run Stopped Early")
     expect(output).toContain("# Orchestration Diagram")
     expect(output).toContain("PROPOSED AGENT CARDS:")
+  })
+
+  test("nests every child session under the calling session", async () => {
+    const mock = createMockClient({
+      respond: pipelineResponder({ analysis: analysis(), specs: specs() }),
+    })
+    const tool = getOrchestrateTool(mock.client, { id: "p1" }, process.cwd(), process.cwd(), {})
+
+    await tool.execute(
+      { prompt: LONG_PROMPT },
+      { sessionID: "ses_parent", abort: new AbortController().signal },
+    )
+
+    // Without parentID these sessions are orphans the TUI never lists under
+    // the run that created them.
+    expect(mock.state.sessionRecords.length).toBeGreaterThan(0)
+    for (const record of mock.state.sessionRecords) {
+      expect(record.parentID).toBe("ses_parent")
+    }
+  })
+
+  test("writes the full report to disk and announces it", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "af-report-"))
+    try {
+      const mock = createMockClient({
+        respond: pipelineResponder({ analysis: analysis(), specs: specs() }),
+      })
+      const tool = getOrchestrateTool(mock.client, { id: "p1" }, dir, dir, {})
+
+      const output = (await tool.execute(
+        { prompt: LONG_PROMPT },
+        { abort: new AbortController().signal },
+      )) as string
+
+      const reportPath = join(dir, ".agent-factory", "last-orchestration.md")
+      expect(existsSync(reportPath)).toBe(true)
+      const saved = readFileSync(reportPath, "utf8")
+      expect(saved).toContain("# Orchestration Diagram")
+      expect(saved).toContain("## Execution Summary")
+      expect(saved).toContain("PROPOSED AGENT CARDS:")
+
+      // The tool output leads with the run stats and points at the file, so
+      // the model cannot paraphrase the diagram away entirely.
+      expect(output).toContain("**Orchestrate:**")
+      expect(output).toContain("full report:")
+      expect(mock.state.toasts.some(toast => toast.variant === "success")).toBe(true)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("saves the failure report and shows an error toast", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "af-report-fail-"))
+    try {
+      const mock = createMockClient({
+        respond: pipelineResponder({ analysis: analysis(), specs: specs() }),
+        promptDelayMs: 1000,
+      })
+      const tool = getOrchestrateTool(mock.client, { id: "p1" }, dir, dir, {
+        phaseTimeoutMs: 200,
+        overallTimeoutMs: 60000,
+        maxRetries: 0,
+      })
+
+      const output = (await tool.execute(
+        { prompt: LONG_PROMPT },
+        { abort: new AbortController().signal },
+      )) as string
+
+      expect(output).toContain("## Orchestration Failed")
+      const reportPath = join(dir, ".agent-factory", "last-orchestration.md")
+      expect(existsSync(reportPath)).toBe(true)
+      expect(readFileSync(reportPath, "utf8")).toContain("## Orchestration Failed")
+      expect(mock.state.toasts.some(toast => toast.variant === "error")).toBe(true)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+})
+
+describe("live sub-agent visibility", () => {
+  test("streams child session activity into progress while the run is active", async () => {
+    const responder = pipelineResponder({ analysis: analysis(), specs: specs() })
+    const mock = createMockClient({
+      respond: (prompt, index) => {
+        // OpenCode forwards every server event to the plugin; simulate the
+        // events a real sub-agent would emit while it works.
+        forwardRunEvent({
+          type: "message.part.updated",
+          properties: {
+            part: {
+              type: "tool",
+              tool: "bash",
+              sessionID: prompt.sessionId,
+              state: { status: "running" },
+            },
+          },
+        })
+        return responder(prompt)
+      },
+    })
+    const context = makeContext(mock.client)
+    const events: Array<{ phase: string; step: string; progress: number; message: string; metadata?: any }> = []
+    context.onProgress = event => events.push(event)
+
+    await runOrchestration(context, LONG_PROMPT, "auto")
+
+    const agentEvents = events.filter(event => event.step.startsWith("agent:"))
+    expect(agentEvents.length).toBeGreaterThan(0)
+    expect(agentEvents[0].phase).toBe("agents")
+    expect(agentEvents[0].message).toContain("tool bash")
+    expect(agentEvents[0].metadata?.sessionId).toBe(mock.state.created[0])
+
+    // The watcher unregisters when the run ends, so stale sessions from a
+    // finished run cannot keep emitting.
+    const before = events.length
+    forwardRunEvent({ type: "session.idle", properties: { sessionID: mock.state.created[0] } })
+    expect(events.length).toBe(before)
+  })
+
+  test("ignores events from sessions the run did not create", async () => {
+    const responder = pipelineResponder({ analysis: analysis(), specs: specs() })
+    const mock = createMockClient({
+      respond: (prompt, index) => {
+        forwardRunEvent({
+          type: "message.part.updated",
+          properties: { part: { type: "tool", tool: "bash", sessionID: "someone-elses-session" } },
+        })
+        forwardRunEvent({ type: "session.idle", properties: { sessionID: prompt.sessionId } })
+        return responder(prompt)
+      },
+    })
+    const context = makeContext(mock.client)
+    const events: Array<{ step: string; message: string; metadata?: any }> = []
+    context.onProgress = event => events.push(event)
+
+    await runOrchestration(context, LONG_PROMPT, "auto")
+
+    const agentEvents = events.filter(event => event.step.startsWith("agent:"))
+    expect(agentEvents.every(event => event.metadata?.sessionId !== "someone-elses-session")).toBe(true)
+    expect(agentEvents.some(event => event.message === "finished")).toBe(true)
   })
 })
 
